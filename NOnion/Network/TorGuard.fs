@@ -245,14 +245,22 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
             | None -> return None
         }
 
+    member private self.KillChildCircuits() =
+        TorLogger.Log "TorGuard: guard is dead, telling children..."
+
+        let killCircuits() =
+            circuitsMap
+            |> Map.iter(fun _cid circuit -> circuit.HandleDestroyedGuard())
+
+        lock circuitSetupLock killCircuits
+
     member private self.StartListening() =
         let rec readFromStream() =
             async {
                 let! maybeCell = self.ReceiveMessage()
 
                 match maybeCell with
-                | None ->
-                    TorLogger.Log "TorGuard: guard receiving thread stopped"
+                | None -> self.KillChildCircuits()
                 | Some(cid, cell) ->
                     if cid = 0us then
                         //TODO: handle control message?
@@ -340,7 +348,8 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
         lock circuitSetupLock (fun () -> createCircuitId 0)
 
     interface IDisposable with
-        member __.Dispose() =
+        member self.Dispose() =
+            self.KillChildCircuits()
             shutdownToken.Cancel()
             sslStream.Dispose()
             client.Close()

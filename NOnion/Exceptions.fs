@@ -27,7 +27,10 @@ type CircuitTruncatedException internal (reason: DestroyReason) =
 type CircuitDestroyedException internal (reason: DestroyReason) =
     inherit NOnionException(sprintf "Circuit got destroyed, reason %A" reason)
 
-type TimeoutErrorException internal () =
+type GuardDisconnectionException() =
+    inherit NOnionException("Guard got disconnected")
+
+type TimeoutErrorException() =
     inherit NOnionException("Time limit exceeded for operation")
 
 type UnsuccessfulHttpRequestException internal (statusCode: string) =
