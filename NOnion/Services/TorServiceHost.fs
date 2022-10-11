@@ -98,7 +98,7 @@ type TorServiceHost
         }
 
     member private self.IntroductionPointDeathCallBack() =
-        introductionPointDeadCounter <- introductionPointDeadCounter + 1
+        Interlocked.Increment(ref introductionPointDeadCounter) |> ignore
         ()
 
     member private self.RelayIntroduceCallback(introduce: RelayIntroduce) =

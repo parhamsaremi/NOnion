@@ -708,7 +708,7 @@ type TorCircuit
     member self.RegisterAsIntroductionPointAsync
         (authKeyPairOpt: Option<AsymmetricCipherKeyPair>)
         (callback: Func<RelayIntroduce, Task>)
-        (disconnectionCallback: Action)
+        (introduceCallback: Action)
         =
         let asyncCallback =
             fun relayIntroduce ->
@@ -716,12 +716,12 @@ type TorCircuit
                     return! callback.Invoke(relayIntroduce) |> Async.AwaitTask
                 }
 
-        let disconnectionCallback = fun () -> disconnectionCallback.Invoke()
+        let introduceCallback = fun () -> introduceCallback.Invoke()
 
         self.RegisterAsIntroductionPoint
             authKeyPairOpt
             asyncCallback
-            disconnectionCallback
+            introduceCallback
         |> Async.StartAsTask
 
     member self.RegisterAsRendezvousPointAsync(cookie: array<byte>) =
@@ -744,7 +744,7 @@ type TorCircuit
 
         lock streamSetupLock safeRegister
 
-    member private self.KillChildStreams() =
+    member private self.AnnounceCircuitDeath() =
         TorLogger.Log "TorCircuit: circuit is dead, telling children..."
 
         let killStreams() =
@@ -787,7 +787,7 @@ type TorCircuit
                 | Destroyed(circuitId, _)
                 | Truncated(circuitId, _) ->
                     circuitState <- Disconnected circuitId
-                    self.KillChildStreams()
+                    self.AnnounceCircuitDeath()
 
             controlLock.RunSyncWithSemaphore handleDestroyed
 
@@ -971,7 +971,7 @@ type TorCircuit
                             | Truncated(circuitId, _) ->
                                 circuitState <- Truncated(circuitId, reason)
 
-                                self.KillChildStreams()
+                                self.AnnounceCircuitDeath()
 
                         controlLock.RunSyncWithSemaphore handleTruncated
                     | RelayData.RelayIntroduceAck ackMsg ->
@@ -1110,7 +1110,7 @@ type TorCircuit
                             circuitState <-
                                 Destroyed(circuitId, destroyCell.Reason)
 
-                            self.KillChildStreams()
+                            self.AnnounceCircuitDeath()
 
                     controlLock.RunSyncWithSemaphore handleDestroyed
                 | _ -> ()
