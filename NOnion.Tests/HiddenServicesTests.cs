@@ -50,7 +50,7 @@ namespace NOnion.Tests
             return Task.CompletedTask;
         }
 
-        private Unit DisconnectionCallback() { }
+        private void DisconnectionCallback() { }
 
 
         [Test]
