@@ -42,13 +42,15 @@ namespace NOnion.Tests
             var circuit = new TorCircuit(guard);
 
             await circuit.CreateAsync(CircuitNodeDetail.FastCreate);
-            await circuit.RegisterAsIntroductionPointAsync(FSharpOption<AsymmetricCipherKeyPair>.None, StubCallback);
+            await circuit.RegisterAsIntroductionPointAsync(FSharpOption<AsymmetricCipherKeyPair>.None, StubCallback, DisconnectionCallback);
         }
 
         private Task StubCallback(RelayIntroduce _)
         {
             return Task.CompletedTask;
         }
+
+        private void DisconnectionCallback() { }
 
 
         [Test]

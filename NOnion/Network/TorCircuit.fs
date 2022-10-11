@@ -716,8 +716,7 @@ type TorCircuit
                     return! callback.Invoke(relayIntroduce) |> Async.AwaitTask
                 }
 
-        let disconnectionCallback =
-            fun () -> disconnectionCallback.Invoke()
+        let disconnectionCallback = fun () -> disconnectionCallback.Invoke()
 
         self.RegisterAsIntroductionPoint
             authKeyPairOpt
