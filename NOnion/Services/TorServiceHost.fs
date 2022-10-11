@@ -45,6 +45,8 @@ type TorServiceHost
     let mutable introductionPointKeys: Map<string, IntroductionPointInfo> =
         Map.empty
 
+    let mutable introductionPointDeadCounter = 0
+
     let mutable guardNode: List<TorGuard> = List.empty
     let introductionPointSemaphore: SemaphoreLocker = SemaphoreLocker()
     let newClientSemaphore = new SemaphoreSlim(0)
@@ -94,6 +96,10 @@ type TorServiceHost
 
             queueLock.RunSyncWithSemaphore registerConnectionRequest
         }
+
+    member private self.IntroductionPointDeathCallBack() =
+        introductionPointDeadCounter <- introductionPointDeadCounter + 1
+        ()
 
     member private self.RelayIntroduceCallback(introduce: RelayIntroduce) =
         let rec tryConnectingToRendezvous
@@ -293,6 +299,7 @@ type TorServiceHost
                                 circuit.RegisterAsIntroductionPoint
                                     (Some authKeyPair)
                                     self.RelayIntroduceCallback
+                                    self.IntroductionPointDeathCallBack
 
                             let safeRegister() =
                                 let introductionPointAlreadyExists =

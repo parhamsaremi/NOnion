@@ -61,12 +61,12 @@ type TorCircuit
         match circuitState with
         | Creating(circuitId, _, _)
         | Extending(circuitId, _, _, _)
-        | RegisteringAsIntroductionPoint(circuitId, _, _, _, _, _)
+        | RegisteringAsIntroductionPoint(circuitId, _, _, _, _, _, _)
         | RegisteringAsRendezvousPoint(circuitId, _, _)
         | WaitingForIntroduceAcknowledge(circuitId, _, _)
         | WaitingForRendezvousRequest(circuitId, _, _, _, _, _, _)
         | Ready(circuitId, _)
-        | ReadyAsIntroductionPoint(circuitId, _, _, _, _)
+        | ReadyAsIntroductionPoint(circuitId, _, _, _, _, _)
         | ReadyAsRendezvousPoint(circuitId, _)
         | Destroyed(circuitId, _)
         | Truncated(circuitId, _) -> circuitId
@@ -94,7 +94,10 @@ type TorCircuit
             match circuitState with
             | Ready(circuitId, nodesStates)
             | Extending(circuitId, _, nodesStates, _)
-            | RegisteringAsIntroductionPoint(circuitId, nodesStates, _, _, _, _)
+            | RegisteringAsIntroductionPoint
+                (
+                    circuitId, nodesStates, _, _, _, _, _
+                )
             | WaitingForIntroduceAcknowledge(circuitId, nodesStates, _)
             | RegisteringAsRendezvousPoint(circuitId, nodesStates, _) ->
                 let onionList, destination =
@@ -207,9 +210,9 @@ type TorCircuit
         let safeDecryptCell() =
             match circuitState with
             | Ready(_circuitId, nodes)
-            | ReadyAsIntroductionPoint(_circuitId, nodes, _, _, _)
+            | ReadyAsIntroductionPoint(_circuitId, nodes, _, _, _, _)
             | ReadyAsRendezvousPoint(_circuitId, nodes)
-            | RegisteringAsIntroductionPoint(_circuitId, nodes, _, _, _, _)
+            | RegisteringAsIntroductionPoint(_circuitId, nodes, _, _, _, _, _)
             | RegisteringAsRendezvousPoint(_circuitId, nodes, _)
             | WaitingForIntroduceAcknowledge(_circuitId, nodes, _)
             | WaitingForRendezvousRequest(_circuitId, nodes, _, _, _, _, _)
@@ -430,6 +433,7 @@ type TorCircuit
     member self.RegisterAsIntroductionPoint
         (authKeyPairOpt: Option<AsymmetricCipherKeyPair>)
         callback
+        disconnetionCallback
         =
         let registerAsIntroduction() =
             async {
@@ -470,7 +474,8 @@ type TorCircuit
                             authPrivateKey,
                             authPublicKey,
                             connectionCompletionSource,
-                            callback
+                            callback,
+                            disconnetionCallback
                         )
 
                     do!
@@ -703,10 +708,21 @@ type TorCircuit
     member self.RegisterAsIntroductionPointAsync
         (authKeyPairOpt: Option<AsymmetricCipherKeyPair>)
         (callback: Func<RelayIntroduce, Task>)
+        (disconnectionCallback: Func<unit>)
         =
-        fun relayIntroduce ->
-            async { return! callback.Invoke(relayIntroduce) |> Async.AwaitTask }
-        |> self.RegisterAsIntroductionPoint authKeyPairOpt
+        let asyncCallback =
+            fun relayIntroduce ->
+                async {
+                    return! callback.Invoke(relayIntroduce) |> Async.AwaitTask
+                }
+
+        let disconnectionCallback =
+            fun () -> disconnectionCallback.Invoke()
+
+        self.RegisterAsIntroductionPoint
+            authKeyPairOpt
+            asyncCallback
+            disconnectionCallback
         |> Async.StartAsTask
 
     member self.RegisterAsRendezvousPointAsync(cookie: array<byte>) =
@@ -738,6 +754,11 @@ type TorCircuit
 
         lock streamSetupLock killStreams
 
+        match circuitState with
+        | ReadyAsIntroductionPoint(_, _, _, _, _, disconnectionCallback) ->
+            disconnectionCallback()
+        | _ -> ()
+
     interface ITorCircuit with
         member self.HandleDestroyedGuard() =
             let handleDestroyed() =
@@ -752,7 +773,7 @@ type TorCircuit
 
                     tcs.SetException(GuardDisconnectionException())
                 | RegisteringAsRendezvousPoint(circuitId, _, tcs)
-                | RegisteringAsIntroductionPoint(circuitId, _, _, _, tcs, _)
+                | RegisteringAsIntroductionPoint(circuitId, _, _, _, tcs, _, _)
                 | WaitingForRendezvousRequest(circuitId, _, _, _, _, _, tcs) ->
                     circuitState <- Disconnected circuitId
 
@@ -762,7 +783,7 @@ type TorCircuit
 
                     tcs.SetException(GuardDisconnectionException())
                 | Ready(circuitId, _)
-                | ReadyAsIntroductionPoint(circuitId, _, _, _, _)
+                | ReadyAsIntroductionPoint(circuitId, _, _, _, _, _)
                 | ReadyAsRendezvousPoint(circuitId, _)
                 | Destroyed(circuitId, _)
                 | Truncated(circuitId, _) ->
@@ -856,7 +877,8 @@ type TorCircuit
                                     _privateKey,
                                     _publicKey,
                                     tcs,
-                                    _callback
+                                    _callback,
+                                    _disconnectionCallback
                                 ) ->
                                 circuitState <-
                                     ReadyAsIntroductionPoint(
@@ -864,7 +886,8 @@ type TorCircuit
                                         nodes,
                                         _privateKey,
                                         _publicKey,
-                                        _callback
+                                        _callback,
+                                        _disconnectionCallback
                                     )
 
                                 tcs.SetResult()
@@ -895,8 +918,10 @@ type TorCircuit
                         let handleIntroduce() =
                             async {
                                 match circuitState with
-                                | ReadyAsIntroductionPoint(_, _, _, _, callback) ->
-                                    do! callback(introduceMsg)
+                                | ReadyAsIntroductionPoint
+                                    (
+                                        _, _, _, _, callback, _
+                                    ) -> do! callback(introduceMsg)
                                 | _ ->
                                     return
                                         failwith
@@ -927,7 +952,7 @@ type TorCircuit
                             | RegisteringAsRendezvousPoint(circuitId, _, tcs)
                             | RegisteringAsIntroductionPoint
                                 (
-                                    circuitId, _, _, _, tcs, _
+                                    circuitId, _, _, _, tcs, _, _
                                 )
                             | WaitingForRendezvousRequest
                                 (
@@ -940,7 +965,7 @@ type TorCircuit
                                 )
                             //FIXME: how can we tell the user that circuit is destroyed? if we throw here the listening thread with throw and user never finds out why
                             | Ready(circuitId, _)
-                            | ReadyAsIntroductionPoint(circuitId, _, _, _, _)
+                            | ReadyAsIntroductionPoint(circuitId, _, _, _, _, _)
                             | ReadyAsRendezvousPoint(circuitId, _)
                             // The circuit was already dead in our eyes, so we don't care about it being destroyed, just update the state to new destroyed state
                             | Destroyed(circuitId, _)
@@ -1056,7 +1081,7 @@ type TorCircuit
                         | RegisteringAsRendezvousPoint(circuitId, _, tcs)
                         | RegisteringAsIntroductionPoint
                             (
-                                circuitId, _, _, _, tcs, _
+                                circuitId, _, _, _, tcs, _, _
                             )
                         | WaitingForRendezvousRequest
                             (
@@ -1078,7 +1103,7 @@ type TorCircuit
                             )
                         //FIXME: how can we tell the user that circuit is destroyed? if we throw here the listening thread will throw and user never finds out why
                         | Ready(circuitId, _)
-                        | ReadyAsIntroductionPoint(circuitId, _, _, _, _)
+                        | ReadyAsIntroductionPoint(circuitId, _, _, _, _, _)
                         | ReadyAsRendezvousPoint(circuitId, _)
                         // The circuit was already dead in our eyes, so we don't care about it being destroyed, just update the state to new destroyed state
                         | Destroyed(circuitId, _)
