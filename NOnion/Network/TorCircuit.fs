@@ -708,7 +708,7 @@ type TorCircuit
     member self.RegisterAsIntroductionPointAsync
         (authKeyPairOpt: Option<AsymmetricCipherKeyPair>)
         (callback: Func<RelayIntroduce, Task>)
-        (disconnectionCallback: Func<unit>)
+        (disconnectionCallback: Func<unit, unit>)
         =
         let asyncCallback =
             fun relayIntroduce ->
