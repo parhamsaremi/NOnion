@@ -790,9 +790,17 @@ type TorServiceHost
 
             let rec getConnectionRequest() =
                 async {
-                    do!
-                        newClientSemaphore.WaitAsync(linkedCts.Token)
-                        |> Async.AwaitTask
+                    try
+                        do!
+                            newClientSemaphore.WaitAsync(linkedCts.Token)
+                            |> Async.AwaitTask
+                    with
+                    | :? OperationCanceledException as ex ->
+                        if introductionPointDisconnectionToken.IsCancellationRequested then
+                            return raise <| IntroductoinPointsKilledException()
+                        else
+                            return raise <| FSharpUtil.ReRaise ex
+
 
                     let nextItemOpt =
                         queueLock.RunSyncWithSemaphore tryGetConnectionRequest

@@ -51,3 +51,6 @@ type NOnionSocketException
             "Got socket exception during data transfer",
             innerException
         )
+
+type IntroductoinPointsKilledException() =
+    inherit NOnionException("IntroductionPoints are dead while TorServiceHost is alive")
