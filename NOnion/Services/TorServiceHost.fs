@@ -46,6 +46,7 @@ type TorServiceHost
         Map.empty
 
     let mutable introductionPointDeadCounter = 0
+    let incrementLock: obj = obj()
 
     let mutable guardNode: List<TorGuard> = List.empty
     let introductionPointSemaphore: SemaphoreLocker = SemaphoreLocker()
@@ -98,8 +99,11 @@ type TorServiceHost
         }
 
     member private self.IntroductionPointDeathCallBack() =
-        Interlocked.Increment(ref introductionPointDeadCounter) |> ignore
-        ()
+        lock
+            incrementLock
+            (fun () ->
+                introductionPointDeadCounter <- introductionPointDeadCounter + 1
+            )
 
     member private self.RelayIntroduceCallback(introduce: RelayIntroduce) =
         let rec tryConnectingToRendezvous
