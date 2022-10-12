@@ -773,6 +773,12 @@ type TorServiceHost
             let! cancelToken = Async.CancellationToken
             cancelToken.ThrowIfCancellationRequested()
 
+            let linkedCts =
+                CancellationTokenSource.CreateLinkedTokenSource(
+                    cancelToken,
+                    introductionPointDisconnectionToken.Token
+                )
+
             let tryGetConnectionRequest() =
                 let nextItemOpt = pendingConnectionQueue.TryUncons
 
@@ -785,7 +791,7 @@ type TorServiceHost
             let rec getConnectionRequest() =
                 async {
                     do!
-                        newClientSemaphore.WaitAsync(cancelToken)
+                        newClientSemaphore.WaitAsync(linkedCts.Token)
                         |> Async.AwaitTask
 
                     let nextItemOpt =
