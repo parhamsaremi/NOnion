@@ -48,6 +48,9 @@ type TorServiceHost
     let mutable introductionPointDeadCounter = 0
     let incrementLock: obj = obj()
 
+    let introductionPointDisconnectionToken: CancellationTokenSource =
+        new CancellationTokenSource()
+
     let mutable guardNode: List<TorGuard> = List.empty
     let introductionPointSemaphore: SemaphoreLocker = SemaphoreLocker()
     let newClientSemaphore = new SemaphoreSlim(0)
@@ -103,6 +106,10 @@ type TorServiceHost
             incrementLock
             (fun () ->
                 introductionPointDeadCounter <- introductionPointDeadCounter + 1
+
+                if introductionPointDeadCounter > Constants.HiddenServices.IntroductionPointCount
+                                                  / 2 then
+                    introductionPointDisconnectionToken.Cancel()
             )
 
     member private self.RelayIntroduceCallback(introduce: RelayIntroduce) =
