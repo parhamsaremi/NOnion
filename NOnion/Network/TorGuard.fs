@@ -34,77 +34,69 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
     // Prevents two circuit setup happening at once (to prevent race condition on writing to CircuitIds list)
     let circuitSetupLock: obj = obj()
 
-    let sendMailBoxProcessor(inbox: MailboxProcessor<GuardSendMessage>) =
-        async {
-            let innerSend circuitId (cellToSend: ICell) =
-                async {
-                    use memStream =
-                        new MemoryStream(Constants.FixedPayloadLength)
+    let rec SendMailBoxProcessor(inbox: MailboxProcessor<GuardSendMessage>) =
+        let innerSend circuitId (cellToSend: ICell) =
+            async {
+                use memStream = new MemoryStream(Constants.FixedPayloadLength)
 
-                    use writer = new BinaryWriter(memStream)
-                    cellToSend.Serialize writer
+                use writer = new BinaryWriter(memStream)
+                cellToSend.Serialize writer
 
-                    // Write circuitId and command for the cell
-                    // (We assume every cell that is being sent here uses 0 as circuitId
-                    // because we haven't completed the handshake yet to have a circuit
-                    // up.)
+                // Write circuitId and command for the cell
+                // (We assume every cell that is being sent here uses 0 as circuitId
+                // because we haven't completed the handshake yet to have a circuit
+                // up.)
+                do!
+                    circuitId
+                    |> IntegerSerialization.FromUInt16ToBigEndianByteArray
+                    |> StreamUtil.Write sslStream
+
+                do!
+                    Array.singleton cellToSend.Command
+                    |> StreamUtil.Write sslStream
+
+                if Command.IsVariableLength cellToSend.Command then
                     do!
-                        circuitId
+                        memStream.Length
+                        |> uint16
                         |> IntegerSerialization.FromUInt16ToBigEndianByteArray
                         |> StreamUtil.Write sslStream
+                else
+                    Array.zeroCreate<byte>(
+                        Constants.FixedPayloadLength - int memStream.Position
+                    )
+                    |> writer.Write
 
-                    do!
-                        Array.singleton cellToSend.Command
-                        |> StreamUtil.Write sslStream
+                do! memStream.ToArray() |> StreamUtil.Write sslStream
+            }
 
-                    if Command.IsVariableLength cellToSend.Command then
-                        do!
-                            memStream.Length
-                            |> uint16
-                            |> IntegerSerialization.FromUInt16ToBigEndianByteArray
-                            |> StreamUtil.Write sslStream
-                    else
-                        Array.zeroCreate<byte>(
-                            Constants.FixedPayloadLength
-                            - int memStream.Position
-                        )
-                        |> writer.Write
+        async {
+            let! cancellationToken = Async.CancellationToken
+            cancellationToken.ThrowIfCancellationRequested()
 
-                    do! memStream.ToArray() |> StreamUtil.Write sslStream
-                }
+            let! {
+                     CircuitId = circuitId
+                     CellToSend = cellToSend
+                     ReplyChannel = replyChannel
+                 } = inbox.Receive()
 
-            let rec sendLoop() =
-                async {
-                    let! cancellationToken = Async.CancellationToken
-                    cancellationToken.ThrowIfCancellationRequested()
+            try
+                do! innerSend circuitId cellToSend
+                replyChannel.Reply GuardSendResult.Ok
+            with
+            | exn ->
+                match FSharpUtil.FindException<SocketException> exn with
+                | Some socketExn ->
+                    NOnionSocketException socketExn :> exn
+                    |> GuardSendResult.Failure
+                    |> replyChannel.Reply
+                | None -> GuardSendResult.Failure exn |> replyChannel.Reply
 
-                    let! {
-                             CircuitId = circuitId
-                             CellToSend = cellToSend
-                             ReplyChannel = replyChannel
-                         } = inbox.Receive()
-
-                    try
-                        do! innerSend circuitId cellToSend
-                        replyChannel.Reply GuardSendResult.Ok
-                    with
-                    | exn ->
-                        match FSharpUtil.FindException<SocketException> exn with
-                        | Some socketExn ->
-                            NOnionSocketException socketExn :> exn
-                            |> GuardSendResult.Failure
-                            |> replyChannel.Reply
-                        | None ->
-                            GuardSendResult.Failure exn |> replyChannel.Reply
-
-                    return! sendLoop()
-                }
-
-            return! sendLoop()
+            return! SendMailBoxProcessor inbox
         }
 
     let sendMailBox =
-        MailboxProcessor.Start(sendMailBoxProcessor, shutdownToken.Token)
+        MailboxProcessor.Start(SendMailBoxProcessor, shutdownToken.Token)
 
     static member NewClient(ipEndpoint: IPEndPoint) =
         async {
@@ -183,11 +175,11 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
     member __.Send (circuitId: uint16) (cellToSend: ICell) =
         async {
             let! sendResult =
-                sendMailBox.PostAndAsyncReply(fun _replyChannel ->
+                sendMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
                         CircuitId = circuitId
                         CellToSend = cellToSend
-                        ReplyChannel = _replyChannel
+                        ReplyChannel = replyChannel
                     }
                 )
 
