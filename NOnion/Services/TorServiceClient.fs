@@ -87,25 +87,18 @@ type TorServiceClient =
                                     do!
                                         circuit.Extend randomMiddleNode
                                         |> Async.Ignore
+
                                     try
                                         do!
                                             circuit.Extend hsDirectoryNode
                                             |> Async.Ignore
-                                    with
-                                    | :? NOnionException ->
-                                         return! downloadDescriptor tail
 
-                                    let dirStream = TorStream circuit
+                                        let dirStream = TorStream circuit
 
-                                    try
                                         do!
                                             dirStream.ConnectToDirectory()
                                             |> Async.Ignore
-                                    with
-                                    | :? NOnionException ->
-                                         return! downloadDescriptor tail
-                                    
-                                    try
+
                                         let! documentInString =
                                             TorHttpClient(
                                                 dirStream,
@@ -124,7 +117,7 @@ type TorServiceClient =
                                                 documentInString
                                     with
                                     | :? NOnionException ->
-                                         return! downloadDescriptor tail
+                                        return! downloadDescriptor tail
 
                                 with
                                 | :? NOnionException ->
