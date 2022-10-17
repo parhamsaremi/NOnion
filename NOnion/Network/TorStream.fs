@@ -241,7 +241,9 @@ type TorStream(circuit: TorCircuit) =
                  } = inbox.Receive()
 
             match command with
-            | End -> do! safeEnd()
+            | End ->
+                do! safeEnd()
+                StreamControlResult.Ok |> replyChannel.Reply
 
             return! StreamControlMailBoxProcessor inbox
         }
