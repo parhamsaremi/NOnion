@@ -24,6 +24,19 @@ type internal StreamRecieveMessage =
         ReplyChannel: AsyncReplyChannel<StreamRecieveResult>
     }
 
+[<RequireQualifiedAccess>]
+type internal StreamControlResult =
+    | Ok
+    | Failure of exn
+
+type internal StreamContolCommand = | End
+
+type internal StreamControlMessage =
+    {
+        Command: StreamContolCommand
+        ReplyChannel: AsyncReplyChannel<StreamControlResult>
+    }
+
 type TorStream(circuit: TorCircuit) =
 
     let mutable streamState: StreamState = StreamState.Initialized
@@ -197,8 +210,48 @@ type TorStream(circuit: TorCircuit) =
             return! StreamRecieveMailBoxProcessor inbox
         }
 
+    let rec StreamControlMailBoxProcessor
+        (inbox: MailboxProcessor<StreamControlMessage>)
+        =
+        let safeEnd() =
+            async {
+                match streamState with
+                | Connected streamId ->
+                    do!
+                        circuit.SendRelayCell
+                            streamId
+                            (RelayEnd EndReason.Done)
+                            None
+
+                    sprintf
+                        "TorStream[%i,%i]: sending stream end packet"
+                        streamId
+                        circuit.Id
+                    |> TorLogger.Log
+                | _ -> failwith "Unexpected state when trying to end the stream"
+            }
+
+        async {
+            let! cancellationToken = Async.CancellationToken
+            cancellationToken.ThrowIfCancellationRequested()
+
+            let! {
+                     Command = command
+                     ReplyChannel = replyChannel
+                 } = inbox.Receive()
+
+            match command with
+            | End -> do! safeEnd()
+
+            return! StreamControlMailBoxProcessor inbox
+        }
+
+
     let streamRecieveMailBox =
         MailboxProcessor.Start(StreamRecieveMailBoxProcessor)
+
+    let streamControlMailBox =
+        MailboxProcessor.Start(StreamControlMailBoxProcessor)
 
     static member Accept (streamId: uint16) (circuit: TorCircuit) =
         async {
@@ -218,27 +271,18 @@ type TorStream(circuit: TorCircuit) =
 
     member __.End() =
         async {
-            let safeEnd() =
-                async {
-                    match streamState with
-                    | Connected streamId ->
-                        do!
-                            circuit.SendRelayCell
-                                streamId
-                                (RelayEnd EndReason.Done)
-                                None
+            let! sendResult =
+                streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                    {
+                        Command = StreamContolCommand.End
+                        ReplyChannel = replyChannel
+                    }
+                )
 
-                        sprintf
-                            "TorStream[%i,%i]: sending stream end packet"
-                            streamId
-                            circuit.Id
-                        |> TorLogger.Log
-                    | _ ->
-                        failwith
-                            "Unexpected state when trying to end the stream"
-                }
-
-            return! controlLock.RunAsyncWithSemaphore safeEnd
+            match sendResult with
+            | StreamControlResult.Ok -> return ()
+            | StreamControlResult.Failure exn ->
+                return raise <| FSharpUtil.ReRaise exn
         }
 
     member self.EndAsync() =
