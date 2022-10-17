@@ -9,6 +9,20 @@ open FSharpx.Collections
 open NOnion
 open NOnion.Cells.Relay
 open NOnion.Utility
+open System.Net.Sockets
+
+[<RequireQualifiedAccess>]
+type internal StreamRecieveResult =
+    | Ok of int
+    | Failure of exn
+
+type internal StreamRecieveMessage =
+    {
+        StreamBuffer: array<byte>
+        BufferOffset: int
+        BufferLength: int
+        ReplyChannel: AsyncReplyChannel<StreamRecieveResult>
+    }
 
 type TorStream(circuit: TorCircuit) =
 
@@ -25,7 +39,166 @@ type TorStream(circuit: TorCircuit) =
     let mutable isEOF: bool = false
 
     let incomingCells: BufferBlock<RelayData> = BufferBlock<RelayData>()
-    let receiveLock: SemaphoreLocker = SemaphoreLocker()
+
+    let rec StreamRecieveMailBoxProcessor
+        (inbox: MailboxProcessor<StreamRecieveMessage>)
+        =
+        let currentBufferHasRemainingBytes() =
+            bufferLength > bufferOffset
+
+        let currentBufferRemainingBytes() =
+            bufferLength - bufferOffset
+
+        let readFromCurrentBuffer
+            (buffer: array<byte>)
+            (offset: int)
+            (len: int)
+            =
+            let readLength = min len (currentBufferRemainingBytes())
+            Array.blit currentBuffer bufferOffset buffer offset readLength
+            bufferOffset <- bufferOffset + readLength
+
+            readLength
+
+        let processIncomingCell() =
+            async {
+                let! nextCell = incomingCells.ReceiveAsync() |> Async.AwaitTask
+
+                match nextCell with
+                | RelayData data ->
+                    Array.blit data 0 currentBuffer 0 data.Length
+                    bufferOffset <- 0
+                    bufferLength <- data.Length
+
+                    window.DeliverDecrease()
+
+                    if window.NeedSendme() then
+                        let sendSendMe() =
+                            async {
+                                match streamState with
+                                | Connected streamId ->
+                                    return!
+                                        circuit.SendRelayCell
+                                            streamId
+                                            RelayData.RelaySendMe
+                                            None
+                                | _ ->
+                                    failwith
+                                        "Unexpected state when sending stream-level sendme"
+                            }
+
+                        do! controlLock.RunAsyncWithSemaphore sendSendMe
+
+                | RelayEnd reason when reason = EndReason.Done ->
+                    TorLogger.Log(
+                        sprintf
+                            "TorStream[%i]: pushed EOF to consumer"
+                            circuit.Id
+                    )
+
+                    currentBuffer <- Array.empty
+                    bufferOffset <- 0
+                    bufferLength <- 0
+                    isEOF <- true
+
+                | RelayEnd reason ->
+                    return
+                        failwithf
+                            "Stream closed unexpectedly, reason = %s"
+                            (reason.ToString())
+                | _ ->
+                    return
+                        failwith "IncomingCells should not keep unrelated cells"
+            }
+
+        let rec fillBuffer() =
+            async {
+                do! processIncomingCell()
+
+                if isEOF || currentBufferHasRemainingBytes() then
+                    return ()
+                else
+                    return! fillBuffer()
+            }
+
+        let refillBufferIfNeeded() =
+            async {
+                if not isEOF then
+                    if currentBufferHasRemainingBytes() then
+                        return ()
+                    else
+                        return! fillBuffer()
+            }
+
+
+        let safeReceive(buffer: array<byte>, offset: int, length: int) =
+            async {
+                if length = 0 then
+                    return 0
+                else
+                    do! refillBufferIfNeeded()
+
+                    if isEOF then
+                        return -1
+                    else
+                        let rec tryRead bytesRead bytesRemaining =
+                            async {
+                                if bytesRemaining > 0 && not isEOF then
+                                    do! refillBufferIfNeeded()
+
+                                    let newBytesRead =
+                                        bytesRead
+                                        + (readFromCurrentBuffer
+                                            buffer
+                                            (offset + bytesRead)
+                                            (length - bytesRead))
+
+                                    let newBytesRemaining =
+                                        length - newBytesRead
+
+                                    if incomingCells.Count = 0 then
+                                        return newBytesRead
+                                    else
+                                        return!
+                                            tryRead
+                                                newBytesRead
+                                                newBytesRemaining
+                                else
+                                    return bytesRead
+                            }
+
+                        return! tryRead 0 length
+            }
+
+
+        async {
+            let! cancellationToken = Async.CancellationToken
+            cancellationToken.ThrowIfCancellationRequested()
+
+            let! {
+                     StreamBuffer = buffer
+                     BufferOffset = offset
+                     BufferLength = length
+                     ReplyChannel = replyChannel
+                 } = inbox.Receive()
+
+            try
+                let! recieved = safeReceive(buffer, offset, length)
+                StreamRecieveResult.Ok recieved |> replyChannel.Reply
+            with
+            | exn ->
+                match FSharpUtil.FindException<SocketException> exn with
+                | Some socketExn ->
+                    NOnionSocketException socketExn :> exn
+                    |> StreamRecieveResult.Failure
+                    |> replyChannel.Reply
+                | None -> StreamRecieveResult.Failure exn |> replyChannel.Reply
+
+            return! StreamRecieveMailBoxProcessor inbox
+        }
+
+    let streamRecieveMailBox =
+        MailboxProcessor.Start(StreamRecieveMailBoxProcessor)
 
     static member Accept (streamId: uint16) (circuit: TorCircuit) =
         async {
@@ -198,144 +371,20 @@ type TorStream(circuit: TorCircuit) =
 
     member self.Receive (buffer: array<byte>) (offset: int) (length: int) =
         async {
-            let currentBufferHasRemainingBytes() =
-                bufferLength > bufferOffset
+            let! sendResult =
+                streamRecieveMailBox.PostAndAsyncReply(fun replyChannel ->
+                    {
+                        StreamBuffer = buffer
+                        BufferOffset = offset
+                        BufferLength = length
+                        ReplyChannel = replyChannel
+                    }
+                )
 
-            let currentBufferRemainingBytes() =
-                bufferLength - bufferOffset
-
-            let readFromCurrentBuffer
-                (buffer: array<byte>)
-                (offset: int)
-                (len: int)
-                =
-                let readLength = min len (currentBufferRemainingBytes())
-                Array.blit currentBuffer bufferOffset buffer offset readLength
-                bufferOffset <- bufferOffset + readLength
-
-                readLength
-
-            let processIncomingCell() =
-                async {
-                    let! nextCell =
-                        incomingCells.ReceiveAsync() |> Async.AwaitTask
-
-                    match nextCell with
-                    | RelayData data ->
-                        Array.blit data 0 currentBuffer 0 data.Length
-                        bufferOffset <- 0
-                        bufferLength <- data.Length
-
-                        window.DeliverDecrease()
-
-                        if window.NeedSendme() then
-                            let sendSendMe() =
-                                async {
-                                    match streamState with
-                                    | Connected streamId ->
-                                        return!
-                                            circuit.SendRelayCell
-                                                streamId
-                                                RelayData.RelaySendMe
-                                                None
-                                    | _ ->
-                                        failwith
-                                            "Unexpected state when sending stream-level sendme"
-                                }
-
-                            do! controlLock.RunAsyncWithSemaphore sendSendMe
-
-                    | RelayEnd reason when reason = EndReason.Done ->
-                        TorLogger.Log(
-                            sprintf
-                                "TorStream[%s,%i]: pushed EOF to consumer"
-                                streamState.Id
-                                circuit.Id
-                        )
-
-                        currentBuffer <- Array.empty
-                        bufferOffset <- 0
-                        bufferLength <- 0
-                        isEOF <- true
-
-                        let markStreamAsEnded() =
-                            match streamState with
-                            | Connected streamId ->
-                                streamState <- Ended(streamId, reason)
-                            | _ -> ()
-
-                        controlLock.RunSyncWithSemaphore markStreamAsEnded
-                    | RelayEnd reason ->
-                        return
-                            failwithf
-                                "Stream closed unexpectedly, reason = %s"
-                                (reason.ToString())
-                    | _ ->
-                        return
-                            failwith
-                                "IncomingCells should not keep unrelated cells"
-                }
-
-            let rec fillBuffer() =
-                async {
-                    do! processIncomingCell()
-
-                    if isEOF || currentBufferHasRemainingBytes() then
-                        return ()
-                    else
-                        return! fillBuffer()
-                }
-
-            let refillBufferIfNeeded() =
-                async {
-                    if not isEOF then
-                        if currentBufferHasRemainingBytes() then
-                            return ()
-                        else
-                            return! fillBuffer()
-                }
-
-
-            let safeReceive() =
-                async {
-                    if length = 0 then
-                        return 0
-                    else
-                        do! refillBufferIfNeeded()
-
-                        if isEOF then
-                            return -1
-                        else
-                            let rec tryRead bytesRead bytesRemaining =
-                                async {
-                                    if bytesRemaining > 0 && not isEOF then
-                                        do! refillBufferIfNeeded()
-
-                                        let newBytesRead =
-                                            bytesRead
-                                            + (readFromCurrentBuffer
-                                                buffer
-                                                (offset + bytesRead)
-                                                (length - bytesRead))
-
-                                        let newBytesRemaining =
-                                            length - newBytesRead
-
-                                        if incomingCells.Count = 0 then
-                                            return newBytesRead
-                                        else
-                                            return!
-                                                tryRead
-                                                    newBytesRead
-                                                    newBytesRemaining
-                                    else
-                                        return bytesRead
-                                }
-
-                            return! tryRead 0 length
-                }
-
-            return! receiveLock.RunAsyncWithSemaphore safeReceive
+            match sendResult with
+            | StreamRecieveResult.Ok recieveAmount -> return recieveAmount
+            | StreamRecieveResult.Failure exn ->
+                return raise <| FSharpUtil.ReRaise exn
         }
 
     member self.ReceiveAsync(buffer: array<byte>, offset: int, length: int) =
@@ -374,8 +423,6 @@ type TorStream(circuit: TorCircuit) =
                                 streamId
                                 circuit.Id
                             |> TorLogger.Log
-
-                            streamState <- Ended(streamId, reason)
 
                             Failure(
                                 sprintf
