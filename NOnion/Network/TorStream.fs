@@ -88,7 +88,8 @@ type TorStream(circuit: TorCircuit) =
                                 match Seq.tryHeadTail dataChunks with
                                 | None -> ()
                                 | Some(head, nextDataChunks) ->
-                                    circuit.LastNode.Window.PackageDecrease()
+                                    let! lastNode = circuit.GetLastNode()
+                                    lastNode.Window.PackageDecrease()
 
                                     do!
                                         circuit.SendRelayCell

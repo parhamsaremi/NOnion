@@ -3,7 +3,7 @@
 open System
 open System.Security.Cryptography
 open System.Threading.Tasks
-open System.Net
+open System.Net.Sockets
 
 open Org.BouncyCastle.Crypto
 open Org.BouncyCastle.Crypto.Parameters
@@ -18,13 +18,8 @@ open NOnion.Crypto
 open NOnion.Crypto.Kdf
 open NOnion.TorHandshakes
 open NOnion.Utility
-
-type CircuitNodeDetail =
-    | FastCreate
-    | Create of
-        EndPoint: IPEndPoint *
-        NTorOnionKey: array<byte> *
-        IdentityKey: array<byte>
+open CircuitOperations
+open MailboxResultUtil
 
 type TorCircuit
     private
@@ -39,6 +34,533 @@ type TorCircuit
     let mutable streamsMap: Map<uint16, ITorStream> = Map.empty
     // Prevents two stream setup happening at once (to prevent race condition on writing to StreamIds list)
     let streamSetupLock: obj = obj()
+
+    let rec CircuitMailBoxProcessor(inbox: MailboxProcessor<Operation>) =
+        let internalSendRelayCell
+            (streamId: uint16)
+            (relayData: RelayData)
+            (customDestinationOpt: Option<TorCircuitNode>)
+            (early: bool)
+            =
+            async {
+                match circuitState with
+                | Ready(circuitId, nodesStates)
+                | Extending(circuitId, _, nodesStates, _)
+                | RegisteringAsIntroductionPoint
+                    (
+                        circuitId, nodesStates, _, _, _, _
+                    )
+                | WaitingForIntroduceAcknowledge(circuitId, nodesStates, _)
+                | RegisteringAsRendezvousPoint(circuitId, nodesStates, _) ->
+                    let onionList, destination =
+                        match customDestinationOpt with
+                        | None ->
+                            let reversedNodesList = nodesStates |> Seq.rev
+
+                            let destinationNodeOpt =
+                                reversedNodesList |> Seq.tryHead
+
+                            match destinationNodeOpt with
+                            | None ->
+                                failwith
+                                    "Circuit has no nodes, can't relay data"
+                            | Some destinationNode ->
+                                reversedNodesList, destinationNode
+                        | Some destination ->
+                            nodesStates
+                            |> Seq.takeWhile(fun node -> node <> destination)
+                            |> Seq.append(Seq.singleton destination)
+                            |> Seq.rev,
+                            destination
+
+                    let plainRelayCell =
+                        CellPlainRelay.Create
+                            streamId
+                            relayData
+                            (Array.zeroCreate Constants.RelayDigestLength)
+
+                    let relayPlainBytes = plainRelayCell.ToBytes true
+
+                    destination.CryptoState.ForwardDigest.Update
+                        relayPlainBytes
+                        0
+                        relayPlainBytes.Length
+
+                    let digest =
+                        destination.CryptoState.ForwardDigest.GetDigestBytes()
+                        |> Array.take Constants.RelayDigestLength
+
+                    let plainRelayCell =
+                        { plainRelayCell with
+                            Digest = digest
+                        }
+
+                    let rec encryptMessage
+                        (nodes: seq<TorCircuitNode>)
+                        (message: array<byte>)
+                        =
+                        match Seq.tryHeadTail nodes with
+                        | Some(node, nextNodes) ->
+                            encryptMessage
+                                nextNodes
+                                (node.CryptoState.ForwardCipher.Encrypt message)
+                        | None -> message
+
+                    do!
+                        {
+                            CellEncryptedRelay.EncryptedData =
+                                plainRelayCell.ToBytes false
+                                |> encryptMessage onionList
+                            Early = early
+                        }
+                        |> guard.Send circuitId
+
+                    match relayData with
+                    | RelayData _
+                    | RelaySendMe _ ->
+                        // too many to log
+                        ()
+                    | _ ->
+                        TorLogger.Log(
+                            sprintf
+                                "TorCircuit[%i,%s]: Sent relay cell %A over circuit"
+                                circuitId
+                                circuitState.Name
+                                relayData
+                        )
+                | _ ->
+                    failwithf
+                        "Can't relay cell over circuit, %s state"
+                        (circuitState.ToString())
+            }
+
+        let sendRelayCell streamId relayData customDestinationOpt =
+            async {
+                match circuitState with
+                | Ready _ ->
+                    return!
+                        internalSendRelayCell
+                            streamId
+                            relayData
+                            customDestinationOpt
+                            false
+                | _ ->
+                    return
+                        failwithf
+                            "Can't relay cell over circuit, %s state"
+                            (circuitState.ToString())
+            }
+
+        let getCircuitLastNode() =
+            match circuitState with
+            | Ready(_, nodesStates) ->
+                let lastNodeOpt = nodesStates |> List.rev |> List.tryHead
+
+                match lastNodeOpt with
+                | None -> failwith "BUG: circuit has no nodes"
+                | Some lastNode -> lastNode
+            | _ ->
+                failwith
+                    "Unexpected state when trying to find the last circuit node"
+
+        let requestCreation circuitObj guardDetailOpt =
+            async {
+                match circuitState with
+                | CircuitState.Initialized ->
+                    let circuitId = guard.RegisterCircuit circuitObj
+                    let connectionCompletionSource = TaskCompletionSource()
+
+                    let handshakeState, handshakeCell =
+                        match guardDetailOpt with
+                        | FastCreate ->
+                            let state = FastHandshake.Create() :> IHandshake
+
+                            state,
+                            {
+                                CellCreateFast.X =
+                                    state.GenerateClientMaterial()
+                            }
+                            :> ICell
+                        | Create(_, onionKey, identityKey) ->
+                            let state =
+                                NTorHandshake.Create identityKey onionKey
+                                :> IHandshake
+
+                            state,
+                            {
+                                CellCreate2.HandshakeType = HandshakeType.NTor
+                                HandshakeData = state.GenerateClientMaterial()
+                            }
+                            :> ICell
+
+                    circuitState <-
+                        Creating(
+                            circuitId,
+                            handshakeState,
+                            connectionCompletionSource
+                        )
+
+                    do! guard.Send circuitId handshakeCell
+
+                    TorLogger.Log(
+                        sprintf
+                            "TorCircuit[%i,%s]: sending create cell"
+                            circuitId
+                            circuitState.Name
+                    )
+
+                    return connectionCompletionSource.Task
+                | _ -> return invalidOp "Circuit is already created"
+            }
+
+        let requestExtension nodeDetail =
+            async {
+                match circuitState with
+                | CircuitState.Ready(circuitId, nodes) ->
+                    match nodeDetail with
+                    | FastCreate ->
+                        return
+                            invalidOp
+                                "Only first hop can be created using CREATE_FAST"
+                    | Create(address, onionKey, identityKey) ->
+                        let connectionCompletionSource = TaskCompletionSource()
+
+                        let handshakeState, handshakeCell =
+                            let state =
+                                NTorHandshake.Create identityKey onionKey
+                                :> IHandshake
+
+                            state,
+                            {
+                                RelayExtend2.LinkSpecifiers =
+                                    [
+                                        LinkSpecifier.CreateFromEndPoint address
+                                        {
+                                            LinkSpecifier.Type =
+                                                LinkSpecifierType.LegacyIdentity
+                                            Data = identityKey
+                                        }
+                                    ]
+                                HandshakeType = HandshakeType.NTor
+                                HandshakeData = state.GenerateClientMaterial()
+                            }
+                            |> RelayData.RelayExtend2
+
+                        circuitState <-
+                            Extending(
+                                circuitId,
+                                handshakeState,
+                                nodes,
+                                connectionCompletionSource
+                            )
+
+                        do!
+                            internalSendRelayCell
+                                Constants.DefaultStreamId
+                                handshakeCell
+                                None
+                                true
+
+                        return connectionCompletionSource.Task
+                | _ ->
+                    return
+                        invalidOp
+                            "Circuit is not in a state suitable for extending"
+            }
+
+        let registerAsIntroductionPoint authKeyPairOpt callback =
+            async {
+                match circuitState with
+                | Ready(circuitId, nodes) ->
+                    let lastNode = getCircuitLastNode()
+
+                    let authPrivateKey, authPublicKey =
+                        let authKeyPair =
+                            match authKeyPairOpt with
+                            | Some authKeyPair -> authKeyPair
+                            | None ->
+                                let kpGen = Ed25519KeyPairGenerator()
+                                let random = SecureRandom()
+
+                                kpGen.Init(
+                                    Ed25519KeyGenerationParameters random
+                                )
+
+                                kpGen.GenerateKeyPair()
+
+                        authKeyPair.Private :?> Ed25519PrivateKeyParameters,
+                        authKeyPair.Public :?> Ed25519PublicKeyParameters
+
+                    let establishIntroCell =
+                        RelayEstablishIntro.Create
+                            authPrivateKey
+                            authPublicKey
+                            lastNode.CryptoState.KeyHandshake
+                        |> RelayData.RelayEstablishIntro
+
+                    let connectionCompletionSource = TaskCompletionSource()
+
+                    circuitState <-
+                        CircuitState.RegisteringAsIntroductionPoint(
+                            circuitId,
+                            nodes,
+                            authPrivateKey,
+                            authPublicKey,
+                            connectionCompletionSource,
+                            callback
+                        )
+
+                    do!
+                        internalSendRelayCell
+                            Constants.DefaultStreamId
+                            establishIntroCell
+                            (Some lastNode)
+                            false
+
+                    return connectionCompletionSource.Task
+                | _ ->
+                    return
+                        failwith
+                            "Unexpected state for registering as introduction point"
+            }
+
+        let registerAsRendezvousPoint(cookie: array<byte>) =
+            async {
+                match circuitState with
+                | Ready(circuitId, nodes) ->
+                    let lastNode = getCircuitLastNode()
+
+                    let establishRendezvousCell =
+                        RelayData.RelayEstablishRendezvous cookie
+
+                    let connectionCompletionSource = TaskCompletionSource()
+
+                    circuitState <-
+                        CircuitState.RegisteringAsRendezvousPoint(
+                            circuitId,
+                            nodes,
+                            connectionCompletionSource
+                        )
+
+                    do!
+                        internalSendRelayCell
+                            Constants.DefaultStreamId
+                            establishRendezvousCell
+                            (Some lastNode)
+                            false
+
+                    return connectionCompletionSource.Task
+                | _ ->
+                    return
+                        failwith
+                            "Unexpected state for registering as rendezvous point"
+            }
+
+        let sendIntroduceRequest(introduceMsg: RelayIntroduce) =
+            async {
+                match circuitState with
+                | Ready(circuitId, nodes) ->
+                    let connectionCompletionSource =
+                        TaskCompletionSource<RelayIntroduceAck>()
+
+                    circuitState <-
+                        WaitingForIntroduceAcknowledge(
+                            circuitId,
+                            nodes,
+                            connectionCompletionSource
+                        )
+
+                    do!
+                        internalSendRelayCell
+                            0us
+                            (RelayIntroduce1 introduceMsg)
+                            None
+                            false
+
+                    return connectionCompletionSource.Task
+                | _ ->
+                    return
+                        failwith "Unexpected state when sending introduce msg"
+            }
+
+        let waitForRendezvous
+            (clientRandomPrivateKey: X25519PrivateKeyParameters)
+            (clientRandomPublicKey: X25519PublicKeyParameters)
+            (introAuthPublicKey: Ed25519PublicKeyParameters)
+            (introEncPublicKey: X25519PublicKeyParameters)
+            =
+            async {
+                match circuitState with
+                | ReadyAsRendezvousPoint(circuitId, nodes) ->
+                    let connectionCompletionSource = TaskCompletionSource()
+
+                    circuitState <-
+                        WaitingForRendezvousRequest(
+                            circuitId,
+                            nodes,
+                            clientRandomPrivateKey,
+                            clientRandomPublicKey,
+                            introAuthPublicKey,
+                            introEncPublicKey,
+                            connectionCompletionSource
+                        )
+
+                    return connectionCompletionSource.Task
+                | _ ->
+                    return
+                        failwith
+                            "Unexpected state when waiting for rendezvous join"
+            }
+
+        let sendRendezvousCell
+            (cookie: array<byte>)
+            (clientRandomKey: X25519PublicKeyParameters)
+            (introAuthPublicKey: Ed25519PublicKeyParameters)
+            (introEncPrivateKey: X25519PrivateKeyParameters)
+            (introEncPublicKey: X25519PublicKeyParameters)
+            =
+            async {
+                match circuitState with
+                | Ready(circuitId, nodes) ->
+                    let serverPublicKey, serverPrivateKey =
+                        let kpGenX = X25519KeyPairGenerator()
+                        let random = SecureRandom()
+                        kpGenX.Init(X25519KeyGenerationParameters random)
+                        let keyPair = kpGenX.GenerateKeyPair()
+
+                        keyPair.Public :?> X25519PublicKeyParameters,
+                        keyPair.Private :?> X25519PrivateKeyParameters
+
+                    let ntorKeySeed, mac =
+                        HiddenServicesCipher.CalculateServerRendezvousKeys
+                            clientRandomKey
+                            serverPublicKey
+                            serverPrivateKey
+                            introAuthPublicKey
+                            introEncPrivateKey
+                            introEncPublicKey
+
+                    let rendezvousCell =
+                        {
+                            RelayRendezvous.Cookie = cookie
+                            HandshakeData =
+                                Array.concat
+                                    [ serverPublicKey.GetEncoded(); mac ]
+                        }
+                        |> RelayRendezvous1
+
+                    (*
+                        HACK: Currently, TorCircuit encrypts with forward and decrypts with backward because
+                        we implemented it for client use only, this changes with introducing hidden service host
+                        support.
+                        HiddenServiceHost acts as a server and it should encrypt with Kb and decrypt Kf so we reverse
+                        the ciphers/digests to accommodate this.
+                    *)
+
+                    circuitState <-
+                        Ready(
+                            circuitId,
+                            nodes
+                            @ List.singleton
+                                {
+                                    TorCircuitNode.CryptoState =
+                                        TorCryptoState.FromKdfResult
+                                            (Kdf.ComputeHSKdf ntorKeySeed)
+                                            true
+                                    Window =
+                                        TorWindow
+                                            Constants.DefaultCircuitLevelWindowParams
+                                }
+                        )
+
+                    do!
+                        internalSendRelayCell
+                            0us
+                            rendezvousCell
+                            (List.tryLast nodes)
+                            false
+                | _ ->
+                    return
+                        failwith "Unexpected state when sending rendezvous msg"
+            }
+
+        async {
+            let! cancelToken = Async.CancellationToken
+            cancelToken.ThrowIfCancellationRequested()
+
+            let! op = inbox.Receive()
+
+            match op with
+            | Operation.GetCircuitLastNode replyChannel ->
+                TryExecuteAndReplyAsResult replyChannel getCircuitLastNode
+            | Operation.SendRelayCell
+                (
+                    streamId, relayData, customDestinationOpt, replyChannel
+                ) ->
+                do!
+                    sendRelayCell streamId relayData customDestinationOpt
+                    |> TryExecuteAsyncAndReplyAsResult replyChannel
+            | Operation.Create(circuitObj, guardDetailOpt, replyChannel) ->
+                do!
+                    requestCreation circuitObj guardDetailOpt
+                    |> TryExecuteAsyncAndReplyAsResult replyChannel
+            | Operation.Extend(nodeDetail, replyChannel) ->
+                do!
+                    requestExtension nodeDetail
+                    |> TryExecuteAsyncAndReplyAsResult replyChannel
+            | Operation.RegisterAsIntroductionPoint
+                (
+                    authKeyPairOpt, callback, replyChannel
+                ) ->
+                do!
+                    registerAsIntroductionPoint authKeyPairOpt callback
+                    |> TryExecuteAsyncAndReplyAsResult replyChannel
+            | Operation.RegisterAsRendezvousPoint(cookie, replyChannel) ->
+                do!
+                    registerAsRendezvousPoint cookie
+                    |> TryExecuteAsyncAndReplyAsResult replyChannel
+            | Operation.SendIntroduceRequest(msg, replyChannel) ->
+                do!
+                    sendIntroduceRequest msg
+                    |> TryExecuteAsyncAndReplyAsResult replyChannel
+            | Operation.WaitForRendezvous
+                (
+                    clientRandomPrivateKey,
+                    clientRandomPublicKey,
+                    introAuthPublicKey,
+                    introEncPublicKey,
+                    replyChannel
+                ) ->
+                do!
+                    waitForRendezvous
+                        clientRandomPrivateKey
+                        clientRandomPublicKey
+                        introAuthPublicKey
+                        introEncPublicKey
+                    |> TryExecuteAsyncAndReplyAsResult replyChannel
+            | Operation.SendRendezvousRequest
+                (
+                    cookie: array<byte>,
+                    clientRandomKey,
+                    introAuthPublicKey,
+                    introEncPrivateKey,
+                    introEncPublicKey,
+                    replyChannel
+                ) ->
+                do!
+                    sendRendezvousCell
+                        cookie
+                        clientRandomKey
+                        introAuthPublicKey
+                        introEncPrivateKey
+                        introEncPublicKey
+                    |> TryExecuteAsyncAndReplyAsResult replyChannel
+
+            return! CircuitMailBoxProcessor inbox
+        }
+
+    let circuitOperationsMailBox =
+        MailboxProcessor.Start(CircuitMailBoxProcessor)
 
     //Client-only
     new(guard: TorGuard) = TorCircuit(guard, None)
@@ -72,135 +594,32 @@ type TorCircuit
         | Truncated(circuitId, _) -> circuitId
         | _ -> failwith "should not happen!"
 
-    member __.LastNode =
-        match circuitState with
-        | Ready(_, nodesStates) ->
-            let lastNodeOpt = nodesStates |> List.rev |> List.tryHead
-
-            match lastNodeOpt with
-            | None -> failwith "BUG: circuit has no nodes"
-            | Some lastNode -> lastNode
-        | _ ->
-            failwith
-                "Unexpected state when trying to find the last circuit node"
-
-    member private self.UnsafeSendRelayCell
-        (streamId: uint16)
-        (relayData: RelayData)
-        (customDestinationOpt: Option<TorCircuitNode>)
-        (early: bool)
-        =
+    member __.GetLastNode() =
         async {
-            match circuitState with
-            | Ready(circuitId, nodesStates)
-            | Extending(circuitId, _, nodesStates, _)
-            | RegisteringAsIntroductionPoint(circuitId, nodesStates, _, _, _, _)
-            | WaitingForIntroduceAcknowledge(circuitId, nodesStates, _)
-            | RegisteringAsRendezvousPoint(circuitId, nodesStates, _) ->
-                let onionList, destination =
-                    match customDestinationOpt with
-                    | None ->
-                        let reversedNodesList = nodesStates |> Seq.rev
+            let! lastNodeResult =
+                circuitOperationsMailBox.PostAndAsyncReply
+                    Operation.GetCircuitLastNode
 
-                        let destinationNodeOpt =
-                            reversedNodesList |> Seq.tryHead
-
-                        match destinationNodeOpt with
-                        | None ->
-                            failwith "Circuit has no nodes, can't relay data"
-                        | Some destinationNode ->
-                            reversedNodesList, destinationNode
-                    | Some destination ->
-                        nodesStates
-                        |> Seq.takeWhile(fun node -> node <> destination)
-                        |> Seq.append(Seq.singleton destination)
-                        |> Seq.rev,
-                        destination
-
-                let plainRelayCell =
-                    CellPlainRelay.Create
-                        streamId
-                        relayData
-                        (Array.zeroCreate Constants.RelayDigestLength)
-
-                let relayPlainBytes = plainRelayCell.ToBytes true
-
-                destination.CryptoState.ForwardDigest.Update
-                    relayPlainBytes
-                    0
-                    relayPlainBytes.Length
-
-                let digest =
-                    destination.CryptoState.ForwardDigest.GetDigestBytes()
-                    |> Array.take Constants.RelayDigestLength
-
-                let plainRelayCell =
-                    { plainRelayCell with
-                        Digest = digest
-                    }
-
-                let rec encryptMessage
-                    (nodes: seq<TorCircuitNode>)
-                    (message: array<byte>)
-                    =
-                    match Seq.tryHeadTail nodes with
-                    | Some(node, nextNodes) ->
-                        encryptMessage
-                            nextNodes
-                            (node.CryptoState.ForwardCipher.Encrypt message)
-                    | None -> message
-
-                do!
-                    {
-                        CellEncryptedRelay.EncryptedData =
-                            plainRelayCell.ToBytes false
-                            |> encryptMessage onionList
-                        Early = early
-                    }
-                    |> guard.Send circuitId
-
-                match relayData with
-                | RelayData _
-                | RelaySendMe _ ->
-                    // too many to log
-                    ()
-                | _ ->
-                    TorLogger.Log(
-                        sprintf
-                            "TorCircuit[%i,%s]: Sent relay cell %A over circuit"
-                            self.Id
-                            circuitState.Name
-                            relayData
-                    )
-            | _ ->
-                failwithf
-                    "Can't relay cell over circuit, %s state"
-                    (circuitState.ToString())
+            return UnwrapResult lastNodeResult
         }
 
-    member self.SendRelayCell
+    member __.SendRelayCell
         (streamId: uint16)
         (relayData: RelayData)
         (customDestinationOpt: Option<TorCircuitNode>)
         =
         async {
-            let safeSend() =
-                async {
-                    match circuitState with
-                    | Ready _ ->
-                        return!
-                            self.UnsafeSendRelayCell
-                                streamId
-                                relayData
-                                customDestinationOpt
-                                false
-                    | _ ->
-                        failwithf
-                            "Can't relay cell over circuit, %s state"
-                            (circuitState.ToString())
-                }
+            let! sendResult =
+                circuitOperationsMailBox.PostAndAsyncReply(fun replyChannel ->
+                    Operation.SendRelayCell(
+                        streamId,
+                        relayData,
+                        customDestinationOpt,
+                        replyChannel
+                    )
+                )
 
-            return! controlLock.RunAsyncWithSemaphore safeSend
+            return UnwrapResult sendResult
         }
 
     member private self.DecryptCell(encryptedRelayCell: CellEncryptedRelay) =
@@ -291,251 +710,79 @@ type TorCircuit
 
     member self.Create(guardDetailOpt: CircuitNodeDetail) =
         async {
-            let create() =
-                async {
-                    match circuitState with
-                    | CircuitState.Initialized ->
-                        let circuitId = guard.RegisterCircuit self
-                        let connectionCompletionSource = TaskCompletionSource()
-
-                        let handshakeState, handshakeCell =
-                            match guardDetailOpt with
-                            | FastCreate ->
-                                let state = FastHandshake.Create() :> IHandshake
-
-                                state,
-                                {
-                                    CellCreateFast.X =
-                                        state.GenerateClientMaterial()
-                                }
-                                :> ICell
-                            | Create(_, onionKey, identityKey) ->
-                                let state =
-                                    NTorHandshake.Create identityKey onionKey
-                                    :> IHandshake
-
-                                state,
-                                {
-                                    CellCreate2.HandshakeType =
-                                        HandshakeType.NTor
-                                    HandshakeData =
-                                        state.GenerateClientMaterial()
-                                }
-                                :> ICell
-
-                        circuitState <-
-                            Creating(
-                                circuitId,
-                                handshakeState,
-                                connectionCompletionSource
-                            )
-
-                        do! guard.Send circuitId handshakeCell
-
-                        TorLogger.Log(
-                            sprintf
-                                "TorCircuit[%i,%s]: sending create cell"
-                                self.Id
-                                circuitState.Name
-                        )
-
-                        return connectionCompletionSource.Task
-                    | _ -> return invalidOp "Circuit is already created"
-                }
-
-            let! completionTask = controlLock.RunAsyncWithSemaphore create
+            let! completionTaskRes =
+                circuitOperationsMailBox.PostAndAsyncReply(
+                    (fun replyChannel ->
+                        Operation.Create(self, guardDetailOpt, replyChannel)
+                    ),
+                    Constants.CircuitOperationTimeout.TotalMilliseconds |> int
+                )
 
             return!
-                completionTask
+                completionTaskRes
+                |> UnwrapResult
                 |> Async.AwaitTask
                 |> FSharpUtil.WithTimeout Constants.CircuitOperationTimeout
         }
 
-    member self.Extend(nodeDetail: CircuitNodeDetail) =
+    member __.Extend(nodeDetail: CircuitNodeDetail) =
         async {
-            let extend() =
-                async {
-                    match circuitState with
-                    | CircuitState.Ready(circuitId, nodes) ->
-                        return!
-                            match nodeDetail with
-                            | FastCreate ->
-                                async {
-                                    return
-                                        failwith
-                                            "Only first hop can be created using CREATE_FAST"
-                                }
-                            | Create(address, onionKey, identityKey) ->
-                                async {
-                                    let connectionCompletionSource =
-                                        TaskCompletionSource()
-
-                                    let handshakeState, handshakeCell =
-                                        let state =
-                                            NTorHandshake.Create
-                                                identityKey
-                                                onionKey
-                                            :> IHandshake
-
-                                        state,
-                                        {
-                                            RelayExtend2.LinkSpecifiers =
-                                                [
-                                                    LinkSpecifier.CreateFromEndPoint
-                                                        address
-                                                    {
-                                                        LinkSpecifier.Type =
-                                                            LinkSpecifierType.LegacyIdentity
-                                                        Data = identityKey
-                                                    }
-                                                ]
-                                            HandshakeType = HandshakeType.NTor
-                                            HandshakeData =
-                                                state.GenerateClientMaterial()
-                                        }
-                                        |> RelayData.RelayExtend2
-
-                                    circuitState <-
-                                        Extending(
-                                            circuitId,
-                                            handshakeState,
-                                            nodes,
-                                            connectionCompletionSource
-                                        )
-
-                                    do!
-                                        self.UnsafeSendRelayCell
-                                            Constants.DefaultStreamId
-                                            handshakeCell
-                                            None
-                                            true
-
-                                    return connectionCompletionSource.Task
-                                }
-                    | _ ->
-                        return
-                            invalidOp
-                                "Circuit is not in a state suitable for extending"
-                }
-
-            let! completionTask = controlLock.RunAsyncWithSemaphore extend
+            let! completionTaskRes =
+                circuitOperationsMailBox.PostAndAsyncReply(
+                    (fun replyChannel ->
+                        Operation.Extend(nodeDetail, replyChannel)
+                    ),
+                    Constants.CircuitOperationTimeout.TotalMilliseconds |> int
+                )
 
             return!
-                completionTask
+                completionTaskRes
+                |> UnwrapResult
                 |> Async.AwaitTask
                 |> FSharpUtil.WithTimeout Constants.CircuitOperationTimeout
-
         }
 
-    member self.RegisterAsIntroductionPoint
+    member __.RegisterAsIntroductionPoint
         (authKeyPairOpt: Option<AsymmetricCipherKeyPair>)
         callback
         =
-        let registerAsIntroduction() =
-            async {
-                match circuitState with
-                | Ready(circuitId, nodes) ->
-                    let lastNode = self.LastNode
-
-                    let authPrivateKey, authPublicKey =
-                        let authKeyPair =
-                            match authKeyPairOpt with
-                            | Some authKeyPair -> authKeyPair
-                            | None ->
-                                let kpGen = Ed25519KeyPairGenerator()
-                                let random = SecureRandom()
-
-                                kpGen.Init(
-                                    Ed25519KeyGenerationParameters random
-                                )
-
-                                kpGen.GenerateKeyPair()
-
-                        authKeyPair.Private :?> Ed25519PrivateKeyParameters,
-                        authKeyPair.Public :?> Ed25519PublicKeyParameters
-
-                    let establishIntroCell =
-                        RelayEstablishIntro.Create
-                            authPrivateKey
-                            authPublicKey
-                            lastNode.CryptoState.KeyHandshake
-                        |> RelayData.RelayEstablishIntro
-
-                    let connectionCompletionSource = TaskCompletionSource()
-
-                    circuitState <-
-                        CircuitState.RegisteringAsIntroductionPoint(
-                            circuitId,
-                            nodes,
-                            authPrivateKey,
-                            authPublicKey,
-                            connectionCompletionSource,
-                            callback
-                        )
-
-                    do!
-                        self.UnsafeSendRelayCell
-                            Constants.DefaultStreamId
-                            establishIntroCell
-                            (Some lastNode)
-                            false
-
-                    return connectionCompletionSource.Task
-                | _ ->
-                    return
-                        failwith
-                            "Unexpected state for registering as introduction point"
-            }
-
         async {
-            let! completionTask =
-                controlLock.RunAsyncWithSemaphore registerAsIntroduction
+            let! completionTaskRes =
+                circuitOperationsMailBox.PostAndAsyncReply(
+                    (fun replyChannel ->
+                        Operation.RegisterAsIntroductionPoint(
+                            authKeyPairOpt,
+                            callback,
+                            replyChannel
+                        )
+                    ),
+                    Constants.CircuitOperationTimeout.TotalMilliseconds |> int
+                )
 
             return!
-                completionTask
+                completionTaskRes
+                |> UnwrapResult
                 |> Async.AwaitTask
                 |> FSharpUtil.WithTimeout Constants.CircuitOperationTimeout
         }
 
-    member self.RegisterAsRendezvousPoint(cookie: array<byte>) =
-        let registerAsRendezvousPoint() =
-            async {
-                match circuitState with
-                | Ready(circuitId, nodes) ->
-                    let lastNode = self.LastNode
-
-                    let establishRendezvousCell =
-                        RelayData.RelayEstablishRendezvous cookie
-
-                    let connectionCompletionSource = TaskCompletionSource()
-
-                    circuitState <-
-                        CircuitState.RegisteringAsRendezvousPoint(
-                            circuitId,
-                            nodes,
-                            connectionCompletionSource
-                        )
-
-                    do!
-                        self.UnsafeSendRelayCell
-                            Constants.DefaultStreamId
-                            establishRendezvousCell
-                            (Some lastNode)
-                            false
-
-                    return connectionCompletionSource.Task
-                | _ ->
-                    return
-                        failwith
-                            "Unexpected state for registering as rendezvous point"
-            }
-
+    member __.RegisterAsRendezvousPoint(cookie: array<byte>) =
         async {
-            let! completionTask =
-                controlLock.RunAsyncWithSemaphore registerAsRendezvousPoint
+            let! completionTaskRes =
+                circuitOperationsMailBox.PostAndAsyncReply(
+                    (fun replyChannel ->
+                        Operation.RegisterAsRendezvousPoint(
+                            cookie,
+                            replyChannel
+                        )
+                    ),
+                    Constants.CircuitOperationTimeout.TotalMilliseconds |> int
+                )
+
 
             return!
-                completionTask
+                completionTaskRes
+                |> UnwrapResult
                 |> Async.AwaitTask
                 |> FSharpUtil.WithTimeout Constants.CircuitOperationTimeout
         }
@@ -546,159 +793,81 @@ type TorCircuit
     member self.CreateAsync guardDetailOpt =
         self.Create guardDetailOpt |> Async.StartAsTask
 
-    member self.Introduce(introduceMsg: RelayIntroduce) =
-        let sendIntroduceCell() =
-            async {
-                match circuitState with
-                | Ready(circuitId, nodes) ->
-                    let connectionCompletionSource =
-                        TaskCompletionSource<RelayIntroduceAck>()
-
-                    circuitState <-
-                        WaitingForIntroduceAcknowledge(
-                            circuitId,
-                            nodes,
-                            connectionCompletionSource
-                        )
-
-                    do!
-                        self.UnsafeSendRelayCell
-                            0us
-                            (RelayIntroduce1 introduceMsg)
-                            None
-                            false
-
-                    return connectionCompletionSource.Task
-                | _ ->
-                    return
-                        failwith "Unexpected state when sending introduce msg"
-            }
-
+    member __.Introduce(introduceMsg: RelayIntroduce) =
         async {
-            let! completionTask =
-                controlLock.RunAsyncWithSemaphore sendIntroduceCell
+            let! completionTaskRes =
+                circuitOperationsMailBox.PostAndAsyncReply(
+                    (fun replyChannel ->
+                        Operation.SendIntroduceRequest(
+                            introduceMsg,
+                            replyChannel
+                        )
+                    ),
+                    Constants.CircuitOperationTimeout.TotalMilliseconds |> int
+                )
 
             return!
-                completionTask
+                completionTaskRes
+                |> UnwrapResult
                 |> Async.AwaitTask
                 |> FSharpUtil.WithTimeout Constants.CircuitOperationTimeout
         }
 
-    member self.WaitingForRendezvousJoin
+    member __.WaitingForRendezvousJoin
         (clientRandomPrivateKey: X25519PrivateKeyParameters)
         (clientRandomPublicKey: X25519PublicKeyParameters)
         (introAuthPublicKey: Ed25519PublicKeyParameters)
         (introEncPublicKey: X25519PublicKeyParameters)
         =
-        let waitingForRendezvous() =
-            async {
-                match circuitState with
-                | ReadyAsRendezvousPoint(circuitId, nodes) ->
-                    let connectionCompletionSource = TaskCompletionSource()
-
-                    circuitState <-
-                        WaitingForRendezvousRequest(
-                            circuitId,
-                            nodes,
+        async {
+            let! completionTaskRes =
+                circuitOperationsMailBox.PostAndAsyncReply(
+                    (fun replyChannel ->
+                        Operation.WaitForRendezvous(
                             clientRandomPrivateKey,
                             clientRandomPublicKey,
                             introAuthPublicKey,
                             introEncPublicKey,
-                            connectionCompletionSource
+                            replyChannel
                         )
-
-                    return connectionCompletionSource.Task
-                | _ ->
-                    return
-                        failwith
-                            "Unexpected state when waiting for rendezvous join"
-            }
-
-        async {
-            let! completionTask =
-                controlLock.RunAsyncWithSemaphore waitingForRendezvous
+                    ),
+                    Constants.CircuitRendezvousTimeout.TotalMilliseconds |> int
+                )
 
             return!
-                completionTask
+                completionTaskRes
+                |> UnwrapResult
                 |> Async.AwaitTask
-                |> FSharpUtil.WithTimeout(TimeSpan.FromMinutes 2.)
+                |> FSharpUtil.WithTimeout Constants.CircuitRendezvousTimeout
+
         }
 
-    member self.Rendezvous
+    member __.Rendezvous
         (cookie: array<byte>)
         (clientRandomKey: X25519PublicKeyParameters)
         (introAuthPublicKey: Ed25519PublicKeyParameters)
         (introEncPrivateKey: X25519PrivateKeyParameters)
         (introEncPublicKey: X25519PublicKeyParameters)
         =
-        let sendRendezvousCell() =
-            async {
-                match circuitState with
-                | Ready(circuitId, nodes) ->
-                    let serverPublicKey, serverPrivateKey =
-                        let kpGenX = X25519KeyPairGenerator()
-                        let random = SecureRandom()
-                        kpGenX.Init(X25519KeyGenerationParameters random)
-                        let keyPair = kpGenX.GenerateKeyPair()
 
-                        keyPair.Public :?> X25519PublicKeyParameters,
-                        keyPair.Private :?> X25519PrivateKeyParameters
-
-                    let ntorKeySeed, mac =
-                        HiddenServicesCipher.CalculateServerRendezvousKeys
-                            clientRandomKey
-                            serverPublicKey
-                            serverPrivateKey
-                            introAuthPublicKey
-                            introEncPrivateKey
-                            introEncPublicKey
-
-                    let rendezvousCell =
-                        {
-                            RelayRendezvous.Cookie = cookie
-                            HandshakeData =
-                                Array.concat
-                                    [ serverPublicKey.GetEncoded(); mac ]
-                        }
-                        |> RelayRendezvous1
-
-                    (*
-                        HACK: Currently, TorCircuit encrypts with forward and decrypts with backward because
-                        we implemented it for client use only, this changes with introducing hidden service host
-                        support.
-                        HiddenServiceHost acts as a server and it should encrypt with Kb and decrypt Kf so we reverse
-                        the ciphers/digests to accommodate this.
-                    *)
-
-                    circuitState <-
-                        Ready(
-                            circuitId,
-                            nodes
-                            @ List.singleton
-                                {
-                                    TorCircuitNode.CryptoState =
-                                        TorCryptoState.FromKdfResult
-                                            (Kdf.ComputeHSKdf ntorKeySeed)
-                                            true
-                                    Window =
-                                        TorWindow
-                                            Constants.DefaultCircuitLevelWindowParams
-                                }
+        async {
+            let! completionRes =
+                circuitOperationsMailBox.PostAndAsyncReply(
+                    (fun replyChannel ->
+                        Operation.SendRendezvousRequest(
+                            cookie,
+                            clientRandomKey,
+                            introAuthPublicKey,
+                            introEncPrivateKey,
+                            introEncPublicKey,
+                            replyChannel
                         )
+                    ),
+                    Constants.CircuitOperationTimeout.TotalMilliseconds |> int
+                )
 
-                    do!
-                        self.UnsafeSendRelayCell
-                            0us
-                            rendezvousCell
-                            (List.tryLast nodes)
-                            false
-
-                | _ ->
-                    return
-                        failwith "Unexpected state when sending rendezvous msg"
-            }
-
-        async { do! controlLock.RunAsyncWithSemaphore sendRendezvousCell }
+            return UnwrapResult completionRes
+        }
 
     member self.RegisterAsIntroductionPointAsync
         (authKeyPairOpt: Option<AsymmetricCipherKeyPair>)

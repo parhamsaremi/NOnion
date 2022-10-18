@@ -20,6 +20,7 @@
     <Compile Include="HandshakeType.fs" />
     <Compile Include="Utility\FSharpUtil.fs" />
     <Compile Include="Utility\ResultUtil.fs" />
+    <Compile Include="Utility\MailboxUtil.fs" />
     <Compile Include="Utility\StreamUtil.fs" />
     <Compile Include="Utility\SemaphoreLocker.fs" />
     <Compile Include="Utility\Base64Util.fs" />
@@ -70,6 +71,7 @@
     <Compile Include="Network\CircuitState.fs" />
     <Compile Include="Network\StreamState.fs" />
     <Compile Include="Network\TorGuard.fs" />
+    <Compile Include="Network\CircuitOperations.fs" />
     <Compile Include="Network\TorCircuit.fs" />
     <Compile Include="Network\TorStream.fs" />
     <Compile Include="Http\TorHttpClient.fs" />
