@@ -19,7 +19,7 @@ type internal StreamReceiveMessage =
         ReplyChannel: AsyncReplyChannel<OperationResult<int>>
     }
 
-type internal StreamContolCommand =
+type internal StreamControlCommand =
     | End of AsyncReplyChannel<OperationResult<unit>>
     | Send of array<byte> * AsyncReplyChannel<OperationResult<unit>>
     | StartServiceConnectionProcess of
@@ -42,10 +42,10 @@ type internal StreamContolCommand =
 
 type internal StreamControlMessage<'T> =
     {
-        Command: StreamContolCommand
+        Command: StreamControlCommand
     }
 
-module StreamContolHandleError =
+module StreamControlHandleError =
     let HandleError<'T>
         (
             exn,
@@ -243,49 +243,49 @@ type TorStream(circuit: TorCircuit) =
                     do! safeEnd()
                     OperationResult.Ok() |> replyChannel.Reply
                 with
-                | exn -> StreamContolHandleError.HandleError(exn, replyChannel)
+                | exn -> StreamControlHandleError.HandleError(exn, replyChannel)
             | Send(data, replyChannel) ->
                 try
                     do! safeSend data
                     OperationResult.Ok() |> replyChannel.Reply
                 with
-                | exn -> StreamContolHandleError.HandleError(exn, replyChannel)
+                | exn -> StreamControlHandleError.HandleError(exn, replyChannel)
             | StartServiceConnectionProcess(port, streamObj, replyChannel) ->
                 try
                     let! task = startServiceConnectionProcess(port, streamObj)
                     OperationResult.Ok task |> replyChannel.Reply
                 with
-                | exn -> StreamContolHandleError.HandleError(exn, replyChannel)
+                | exn -> StreamControlHandleError.HandleError(exn, replyChannel)
             | StartDirectoryConnectionProcess(streamObj, replyChannel) ->
                 try
                     let! task = startDirectoryConnectionProcess(streamObj)
                     OperationResult.Ok task |> replyChannel.Reply
                 with
-                | exn -> StreamContolHandleError.HandleError(exn, replyChannel)
+                | exn -> StreamControlHandleError.HandleError(exn, replyChannel)
             | RegisterStream(streamObj, streamId, replyChannel) ->
                 try
                     registerProcess(streamObj, streamId)
                     OperationResult.Ok() |> replyChannel.Reply
                 with
-                | exn -> StreamContolHandleError.HandleError(exn, replyChannel)
+                | exn -> StreamControlHandleError.HandleError(exn, replyChannel)
             | HandleRelayConnected replyChannel ->
                 try
                     handleRelayConnected()
                     OperationResult.Ok() |> replyChannel.Reply
                 with
-                | exn -> StreamContolHandleError.HandleError(exn, replyChannel)
+                | exn -> StreamControlHandleError.HandleError(exn, replyChannel)
             | HandleRelayEnd(message, reason, replyChannel) ->
                 try
                     handleRelayEnd(message, reason)
                     OperationResult.Ok() |> replyChannel.Reply
                 with
-                | exn -> StreamContolHandleError.HandleError(exn, replyChannel)
+                | exn -> StreamControlHandleError.HandleError(exn, replyChannel)
             | SendSendMe replyChannel ->
                 try
                     do! sendSendMe()
                     OperationResult.Ok() |> replyChannel.Reply
                 with
-                | exn -> StreamContolHandleError.HandleError(exn, replyChannel)
+                | exn -> StreamControlHandleError.HandleError(exn, replyChannel)
 
 
             return! StreamControlMailBoxProcessor inbox
@@ -332,7 +332,7 @@ type TorStream(circuit: TorCircuit) =
                             streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                                 {
                                     Command =
-                                        StreamContolCommand.SendSendMe
+                                        StreamControlCommand.SendSendMe
                                             replyChannel
                                 }
                             )
@@ -474,7 +474,7 @@ type TorStream(circuit: TorCircuit) =
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
-                        Command = StreamContolCommand.End replyChannel
+                        Command = StreamControlCommand.End replyChannel
                     }
                 )
 
@@ -493,7 +493,7 @@ type TorStream(circuit: TorCircuit) =
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
-                        Command = StreamContolCommand.Send(data, replyChannel)
+                        Command = StreamControlCommand.Send(data, replyChannel)
                     }
                 )
 
@@ -512,7 +512,7 @@ type TorStream(circuit: TorCircuit) =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
                         Command =
-                            StreamContolCommand.StartServiceConnectionProcess(
+                            StreamControlCommand.StartServiceConnectionProcess(
                                 port,
                                 self,
                                 replyChannel
@@ -536,7 +536,7 @@ type TorStream(circuit: TorCircuit) =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
                         Command =
-                            StreamContolCommand.StartDirectoryConnectionProcess(
+                            StreamControlCommand.StartDirectoryConnectionProcess(
                                 self,
                                 replyChannel
                             )
@@ -562,7 +562,7 @@ type TorStream(circuit: TorCircuit) =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
                         Command =
-                            StreamContolCommand.RegisterStream(
+                            StreamControlCommand.RegisterStream(
                                 self,
                                 streamId,
                                 replyChannel
@@ -606,7 +606,7 @@ type TorStream(circuit: TorCircuit) =
                         streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                             {
                                 Command =
-                                    StreamContolCommand.HandleRelayConnected
+                                    StreamControlCommand.HandleRelayConnected
                                         replyChannel
                             }
                         )
@@ -622,7 +622,7 @@ type TorStream(circuit: TorCircuit) =
                         streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                             {
                                 Command =
-                                    StreamContolCommand.HandleRelayEnd(
+                                    StreamControlCommand.HandleRelayEnd(
                                         message,
                                         reason,
                                         replyChannel
