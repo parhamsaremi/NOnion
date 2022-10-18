@@ -27,9 +27,18 @@ type internal StreamRecieveMessage =
 [<RequireQualifiedAccess>]
 type internal StreamControlResult =
     | Ok
+    | OkWithTask of Task<uint16>
     | Failure of exn
 
-type internal StreamContolCommand = | End
+type internal StreamContolCommand =
+    | End
+    | Send of array<byte>
+    | StartServiceConnectionProcess of int * ITorStream
+    | StartDirectoryConnectionProcess of ITorStream
+    | RegisterStream of ITorStream * uint16
+    | HandleRelayConnected
+    | HandleRelayEnd of RelayData * EndReason
+    | SendSendMe
 
 type internal StreamControlMessage =
     {
@@ -40,7 +49,6 @@ type internal StreamControlMessage =
 type TorStream(circuit: TorCircuit) =
 
     let mutable streamState: StreamState = StreamState.Initialized
-    let controlLock: SemaphoreLocker = SemaphoreLocker()
 
     let window: TorWindow = TorWindow Constants.DefaultStreamLevelWindowParams
 
@@ -52,6 +60,212 @@ type TorStream(circuit: TorCircuit) =
     let mutable isEOF: bool = false
 
     let incomingCells: BufferBlock<RelayData> = BufferBlock<RelayData>()
+
+    let rec StreamControlMailBoxProcessor
+        (inbox: MailboxProcessor<StreamControlMessage>)
+        =
+        let safeEnd() =
+            async {
+                match streamState with
+                | Connected streamId ->
+                    do!
+                        circuit.SendRelayCell
+                            streamId
+                            (RelayEnd EndReason.Done)
+                            None
+
+                    sprintf
+                        "TorStream[%i,%i]: sending stream end packet"
+                        streamId
+                        circuit.Id
+                    |> TorLogger.Log
+                | _ -> failwith "Unexpected state when trying to end the stream"
+            }
+
+        let safeSend(data: array<byte>) =
+            async {
+                match streamState with
+                | Connected streamId ->
+                    let dataChunks =
+                        SeqUtils.Chunk Constants.MaximumRelayPayloadLength data
+
+                    let rec sendChunks dataChunks =
+                        async {
+                            match Seq.tryHeadTail dataChunks with
+                            | None -> ()
+                            | Some(head, nextDataChunks) ->
+                                circuit.LastNode.Window.PackageDecrease()
+
+                                do!
+                                    circuit.SendRelayCell
+                                        streamId
+                                        (head
+                                         |> Array.ofSeq
+                                         |> RelayData.RelayData)
+                                        None
+
+                                window.PackageDecrease()
+                                do! nextDataChunks |> sendChunks
+                        }
+
+                    do! sendChunks dataChunks
+                | _ ->
+                    failwith
+                        "Unexpected state when trying to send data over stream"
+            }
+
+        let startServiceConnectionProcess(port: int, streamObj: ITorStream) =
+            async {
+                let streamId = circuit.RegisterStream streamObj None
+
+                let tcs = TaskCompletionSource()
+
+                streamState <- Connecting(streamId, tcs)
+
+                sprintf
+                    "TorStream[%i,%i]: creating a hidden service stream"
+                    streamId
+                    circuit.Id
+                |> TorLogger.Log
+
+                do!
+                    circuit.SendRelayCell
+                        streamId
+                        (RelayBegin
+                            {
+                                RelayBegin.Address = (sprintf ":%i" port)
+                                Flags = 0u
+                            })
+                        None
+
+                return tcs.Task
+            }
+
+        let startDirectoryConnectionProcess streamObj =
+            async {
+                let streamId = circuit.RegisterStream streamObj None
+
+                let tcs = TaskCompletionSource()
+
+                streamState <- Connecting(streamId, tcs)
+
+                sprintf
+                    "TorStream[%i,%i]: creating a directory stream"
+                    streamId
+                    circuit.Id
+                |> TorLogger.Log
+
+                do!
+                    circuit.SendRelayCell
+                        streamId
+                        RelayData.RelayBeginDirectory
+                        None
+
+                return tcs.Task
+            }
+
+        let registerProcess(streamObj: ITorStream, streamId: uint16) =
+            streamState <-
+                circuit.RegisterStream streamObj (Some streamId) |> Connected
+
+        let handleRelayConnected() =
+            match streamState with
+            | Connecting(streamId, tcs) ->
+                streamState <- Connected streamId
+                tcs.SetResult streamId
+
+                sprintf "TorStream[%i,%i]: connected!" streamId circuit.Id
+                |> TorLogger.Log
+            | _ ->
+                failwith "Unexpected state when receiving RelayConnected cell"
+
+        let handleRelayEnd(message: RelayData, reason: EndReason) =
+            match streamState with
+            | Connecting(streamId, tcs) ->
+                sprintf
+                    "TorStream[%i,%i]: received end packet while connecting"
+                    streamId
+                    circuit.Id
+                |> TorLogger.Log
+
+                Failure(
+                    sprintf
+                        "Stream connection process failed! Reason: %s"
+                        (reason.ToString())
+                )
+                |> tcs.SetException
+            | Connected streamId ->
+                sprintf
+                    "TorStream[%i,%i]: received end packet while connected"
+                    streamId
+                    circuit.Id
+                |> TorLogger.Log
+
+                incomingCells.Post message |> ignore<bool>
+            | _ -> failwith "Unexpected state when receiving RelayEnd cell"
+
+        let sendSendMe() =
+            async {
+                match streamState with
+                | Connected streamId ->
+                    return!
+                        circuit.SendRelayCell
+                            streamId
+                            RelayData.RelaySendMe
+                            None
+                | _ ->
+                    failwith "Unexpected state when sending stream-level sendme"
+            }
+
+        async {
+            let! cancellationToken = Async.CancellationToken
+            cancellationToken.ThrowIfCancellationRequested()
+
+            let! {
+                     Command = command
+                     ReplyChannel = replyChannel
+                 } = inbox.Receive()
+
+            try
+                match command with
+                | End ->
+                    do! safeEnd()
+                    StreamControlResult.Ok |> replyChannel.Reply
+                | Send data ->
+                    do! safeSend data
+                    StreamControlResult.Ok |> replyChannel.Reply
+                | StartServiceConnectionProcess(port, streamObj) ->
+                    let! task = startServiceConnectionProcess(port, streamObj)
+                    StreamControlResult.OkWithTask task |> replyChannel.Reply
+                | StartDirectoryConnectionProcess streamObj ->
+                    let! task = startDirectoryConnectionProcess(streamObj)
+                    StreamControlResult.OkWithTask task |> replyChannel.Reply
+                | RegisterStream(streamObj, streamId) ->
+                    registerProcess(streamObj, streamId)
+                    StreamControlResult.Ok |> replyChannel.Reply
+                | HandleRelayConnected ->
+                    handleRelayConnected()
+                    StreamControlResult.Ok |> replyChannel.Reply
+                | HandleRelayEnd(message, reason) ->
+                    handleRelayEnd(message, reason)
+                    StreamControlResult.Ok |> replyChannel.Reply
+                | SendSendMe ->
+                    do! sendSendMe()
+                    StreamControlResult.Ok |> replyChannel.Reply
+            with
+            | exn ->
+                match FSharpUtil.FindException<SocketException> exn with
+                | Some socketExn ->
+                    NOnionSocketException socketExn :> exn
+                    |> StreamControlResult.Failure
+                    |> replyChannel.Reply
+                | None -> StreamControlResult.Failure exn |> replyChannel.Reply
+
+            return! StreamControlMailBoxProcessor inbox
+        }
+
+    let streamControlMailBox =
+        MailboxProcessor.Start(StreamControlMailBoxProcessor)
 
     let rec StreamRecieveMailBoxProcessor
         (inbox: MailboxProcessor<StreamRecieveMessage>)
@@ -86,21 +300,22 @@ type TorStream(circuit: TorCircuit) =
                     window.DeliverDecrease()
 
                     if window.NeedSendme() then
-                        let sendSendMe() =
-                            async {
-                                match streamState with
-                                | Connected streamId ->
-                                    return!
-                                        circuit.SendRelayCell
-                                            streamId
-                                            RelayData.RelaySendMe
-                                            None
-                                | _ ->
-                                    failwith
-                                        "Unexpected state when sending stream-level sendme"
-                            }
 
-                        do! controlLock.RunAsyncWithSemaphore sendSendMe
+                        let! sendResult =
+                            streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                                {
+                                    Command = StreamContolCommand.SendSendMe
+                                    ReplyChannel = replyChannel
+                                }
+                            )
+
+                        match sendResult with
+                        | StreamControlResult.Ok -> return ()
+                        | StreamControlResult.Failure exn ->
+                            return raise <| FSharpUtil.ReRaise exn
+                        | _ ->
+                            return
+                                failwith "Unexpected return state from mailbox"
 
                 | RelayEnd reason when reason = EndReason.Done ->
                     TorLogger.Log(
@@ -210,55 +425,13 @@ type TorStream(circuit: TorCircuit) =
             return! StreamRecieveMailBoxProcessor inbox
         }
 
-    let rec StreamControlMailBoxProcessor
-        (inbox: MailboxProcessor<StreamControlMessage>)
-        =
-        let safeEnd() =
-            async {
-                match streamState with
-                | Connected streamId ->
-                    do!
-                        circuit.SendRelayCell
-                            streamId
-                            (RelayEnd EndReason.Done)
-                            None
-
-                    sprintf
-                        "TorStream[%i,%i]: sending stream end packet"
-                        streamId
-                        circuit.Id
-                    |> TorLogger.Log
-                | _ -> failwith "Unexpected state when trying to end the stream"
-            }
-
-        async {
-            let! cancellationToken = Async.CancellationToken
-            cancellationToken.ThrowIfCancellationRequested()
-
-            let! {
-                     Command = command
-                     ReplyChannel = replyChannel
-                 } = inbox.Receive()
-
-            match command with
-            | End ->
-                do! safeEnd()
-                StreamControlResult.Ok |> replyChannel.Reply
-
-            return! StreamControlMailBoxProcessor inbox
-        }
-
-
     let streamRecieveMailBox =
         MailboxProcessor.Start(StreamRecieveMailBoxProcessor)
-
-    let streamControlMailBox =
-        MailboxProcessor.Start(StreamControlMailBoxProcessor)
 
     static member Accept (streamId: uint16) (circuit: TorCircuit) =
         async {
             let stream = TorStream circuit
-            stream.RegisterIncomingStream streamId
+            do! stream.RegisterIncomingStream streamId
 
             do! circuit.SendRelayCell streamId (RelayConnected Array.empty) None
 
@@ -285,6 +458,7 @@ type TorStream(circuit: TorCircuit) =
             | StreamControlResult.Ok -> return ()
             | StreamControlResult.Failure exn ->
                 return raise <| FSharpUtil.ReRaise exn
+            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.EndAsync() =
@@ -293,127 +467,92 @@ type TorStream(circuit: TorCircuit) =
 
     member __.SendData(data: array<byte>) =
         async {
-            let safeSend() =
-                async {
-                    match streamState with
-                    | Connected streamId ->
-                        let dataChunks =
-                            SeqUtils.Chunk
-                                Constants.MaximumRelayPayloadLength
-                                data
+            let! sendResult =
+                streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                    {
+                        Command = StreamContolCommand.Send data
+                        ReplyChannel = replyChannel
+                    }
+                )
 
-                        let rec sendChunks dataChunks =
-                            async {
-                                match Seq.tryHeadTail dataChunks with
-                                | None -> ()
-                                | Some(head, nextDataChunks) ->
-                                    circuit.LastNode.Window.PackageDecrease()
-
-                                    do!
-                                        circuit.SendRelayCell
-                                            streamId
-                                            (head
-                                             |> Array.ofSeq
-                                             |> RelayData.RelayData)
-                                            None
-
-                                    window.PackageDecrease()
-                                    do! nextDataChunks |> sendChunks
-                            }
-
-                        do! sendChunks dataChunks
-                    | _ ->
-                        failwith
-                            "Unexpected state when trying to send data over stream"
-                }
-
-            return! controlLock.RunAsyncWithSemaphore safeSend
+            match sendResult with
+            | StreamControlResult.Ok -> return ()
+            | StreamControlResult.Failure exn ->
+                return raise <| FSharpUtil.ReRaise exn
+            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.SendDataAsync data =
         self.SendData data |> Async.StartAsTask
 
     member self.ConnectToService(port: int) =
-        let startConnectionProcess() =
-            async {
-                let streamId = circuit.RegisterStream self None
-
-                let tcs = TaskCompletionSource()
-
-                streamState <- Connecting(streamId, tcs)
-
-                sprintf
-                    "TorStream[%i,%i]: creating a hidden service stream"
-                    streamId
-                    circuit.Id
-                |> TorLogger.Log
-
-                do!
-                    circuit.SendRelayCell
-                        streamId
-                        (RelayBegin
-                            {
-                                RelayBegin.Address = (sprintf ":%i" port)
-                                Flags = 0u
-                            })
-                        None
-
-                return tcs.Task
-            }
-
         async {
-            let! connectionProcessTcs =
-                controlLock.RunAsyncWithSemaphore startConnectionProcess
+            let! sendResult =
+                streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                    {
+                        Command =
+                            StreamContolCommand.StartServiceConnectionProcess(
+                                port,
+                                self
+                            )
+                        ReplyChannel = replyChannel
+                    }
+                )
 
-            return!
-                connectionProcessTcs
-                |> Async.AwaitTask
-                |> FSharpUtil.WithTimeout Constants.StreamCreationTimeout
+            match sendResult with
+            | StreamControlResult.OkWithTask connectionProcessTcs ->
+                return!
+                    connectionProcessTcs
+                    |> Async.AwaitTask
+                    |> FSharpUtil.WithTimeout Constants.StreamCreationTimeout
+            | StreamControlResult.Failure exn ->
+                return raise <| FSharpUtil.ReRaise exn
+            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.ConnectToDirectory() =
         async {
-            let startConnectionProcess() =
-                async {
-                    let streamId = circuit.RegisterStream self None
+            let! sendResult =
+                streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                    {
+                        Command =
+                            StreamContolCommand.StartDirectoryConnectionProcess
+                                self
+                        ReplyChannel = replyChannel
+                    }
+                )
 
-                    let tcs = TaskCompletionSource()
-
-                    streamState <- Connecting(streamId, tcs)
-
-                    sprintf
-                        "TorStream[%i,%i]: creating a directory stream"
-                        streamId
-                        circuit.Id
-                    |> TorLogger.Log
-
-                    do!
-                        circuit.SendRelayCell
-                            streamId
-                            RelayData.RelayBeginDirectory
-                            None
-
-                    return tcs.Task
-                }
-
-            let! connectionProcessTcs =
-                controlLock.RunAsyncWithSemaphore startConnectionProcess
-
-            return!
-                connectionProcessTcs
-                |> Async.AwaitTask
-                |> FSharpUtil.WithTimeout Constants.StreamCreationTimeout
+            match sendResult with
+            | StreamControlResult.OkWithTask connectionProcessTcs ->
+                return!
+                    connectionProcessTcs
+                    |> Async.AwaitTask
+                    |> FSharpUtil.WithTimeout Constants.StreamCreationTimeout
+            | StreamControlResult.Failure exn ->
+                return raise <| FSharpUtil.ReRaise exn
+            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.ConnectToDirectoryAsync() =
         self.ConnectToDirectory() |> Async.StartAsTask
 
     member private self.RegisterIncomingStream(streamId: uint16) =
-        let registerProcess() =
-            streamState <-
-                circuit.RegisterStream self (Some streamId) |> Connected
+        async {
+            let! sendResult =
+                streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                    {
+                        Command =
+                            StreamContolCommand.RegisterStream(self, streamId)
+                        ReplyChannel = replyChannel
+                    }
+                )
 
-        controlLock.RunSyncWithSemaphore registerProcess
+            match sendResult with
+            | StreamControlResult.Ok -> return ()
+            | StreamControlResult.Failure exn ->
+                return raise <| FSharpUtil.ReRaise exn
+            | _ -> return failwith "Unexpected return state from mailbox"
+        }
 
     member self.Receive (buffer: array<byte>) (offset: int) (length: int) =
         async {
@@ -441,53 +580,41 @@ type TorStream(circuit: TorCircuit) =
             async {
                 match message with
                 | RelayConnected _ ->
-                    let handleRelayConnected() =
-                        match streamState with
-                        | Connecting(streamId, tcs) ->
-                            streamState <- Connected streamId
-                            tcs.SetResult streamId
+                    let! sendResult =
+                        streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                            {
+                                Command =
+                                    StreamContolCommand.HandleRelayConnected
+                                ReplyChannel = replyChannel
+                            }
+                        )
 
-                            sprintf
-                                "TorStream[%i,%i]: connected!"
-                                streamId
-                                circuit.Id
-                            |> TorLogger.Log
-                        | _ ->
-                            failwith
-                                "Unexpected state when receiving RelayConnected cell"
-
-
-                    controlLock.RunSyncWithSemaphore handleRelayConnected
+                    match sendResult with
+                    | StreamControlResult.Ok -> return ()
+                    | StreamControlResult.Failure exn ->
+                        return raise <| FSharpUtil.ReRaise exn
+                    | _ ->
+                        return failwith "Unexpected return state from mailbox"
                 | RelayData _ -> incomingCells.Post message |> ignore<bool>
                 | RelaySendMe _ -> window.PackageIncrease()
                 | RelayEnd reason ->
-                    let handleRelayEnd() =
-                        match streamState with
-                        | Connecting(streamId, tcs) ->
-                            sprintf
-                                "TorStream[%i,%i]: received end packet while connecting"
-                                streamId
-                                circuit.Id
-                            |> TorLogger.Log
+                    let! sendResult =
+                        streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                            {
+                                Command =
+                                    StreamContolCommand.HandleRelayEnd(
+                                        message,
+                                        reason
+                                    )
+                                ReplyChannel = replyChannel
+                            }
+                        )
 
-                            Failure(
-                                sprintf
-                                    "Stream connection process failed! Reason: %s"
-                                    (reason.ToString())
-                            )
-                            |> tcs.SetException
-                        | Connected streamId ->
-                            sprintf
-                                "TorStream[%i,%i]: received end packet while connected"
-                                streamId
-                                circuit.Id
-                            |> TorLogger.Log
-
-                            incomingCells.Post message |> ignore<bool>
-                        | _ ->
-                            failwith
-                                "Unexpected state when receiving RelayEnd cell"
-
-                    controlLock.RunSyncWithSemaphore handleRelayEnd
+                    match sendResult with
+                    | StreamControlResult.Ok -> return ()
+                    | StreamControlResult.Failure exn ->
+                        return raise <| FSharpUtil.ReRaise exn
+                    | _ ->
+                        return failwith "Unexpected return state from mailbox"
                 | _ -> ()
             }
