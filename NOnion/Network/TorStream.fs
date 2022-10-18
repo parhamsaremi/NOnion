@@ -11,40 +11,37 @@ open NOnion.Cells.Relay
 open NOnion.Utility
 open System.Net.Sockets
 
-[<RequireQualifiedAccess>]
-type internal StreamRecieveResult =
-    | Ok of int
-    | Failure of exn
-
-type internal StreamRecieveMessage =
+type internal StreamReceiveMessage =
     {
         StreamBuffer: array<byte>
         BufferOffset: int
         BufferLength: int
-        ReplyChannel: AsyncReplyChannel<StreamRecieveResult>
+        ReplyChannel: AsyncReplyChannel<OperationResult<int>>
     }
-
-[<RequireQualifiedAccess>]
-type internal StreamControlResult =
-    | Ok
-    | OkWithTask of Task<uint16>
-    | Failure of exn
 
 type internal StreamContolCommand =
-    | End
-    | Send of array<byte>
-    | StartServiceConnectionProcess of int * ITorStream
-    | StartDirectoryConnectionProcess of ITorStream
-    | RegisterStream of ITorStream * uint16
-    | HandleRelayConnected
-    | HandleRelayEnd of RelayData * EndReason
-    | SendSendMe
+    | End of AsyncReplyChannel<OperationResult<unit>>
+    | Send of array<byte> * AsyncReplyChannel<OperationResult<unit>>
+    | StartServiceConnectionProcess of int * ITorStream * AsyncReplyChannel<OperationResult<Task<uint16>>>
+    | StartDirectoryConnectionProcess of ITorStream * AsyncReplyChannel<OperationResult<Task<uint16>>>
+    | RegisterStream of ITorStream * uint16 * AsyncReplyChannel<OperationResult<unit>>
+    | HandleRelayConnected of AsyncReplyChannel<OperationResult<unit>>
+    | HandleRelayEnd of RelayData * EndReason * AsyncReplyChannel<OperationResult<unit>>
+    | SendSendMe of AsyncReplyChannel<OperationResult<unit>>
 
-type internal StreamControlMessage =
+type internal StreamControlMessage<'T> =
     {
         Command: StreamContolCommand
-        ReplyChannel: AsyncReplyChannel<StreamControlResult>
     }
+
+module StreamContolHandleError = 
+    let HandleError<'T> (exn, replyChannel: AsyncReplyChannel<OperationResult<'T>>) = 
+        match FSharpUtil.FindException<SocketException> exn with
+        | Some socketExn ->
+            NOnionSocketException socketExn :> exn
+            |> OperationResult.Failure
+            |> replyChannel.Reply
+        | None -> OperationResult.Failure exn |> replyChannel.Reply
 
 type TorStream(circuit: TorCircuit) =
 
@@ -62,7 +59,7 @@ type TorStream(circuit: TorCircuit) =
     let incomingCells: BufferBlock<RelayData> = BufferBlock<RelayData>()
 
     let rec StreamControlMailBoxProcessor
-        (inbox: MailboxProcessor<StreamControlMessage>)
+        (inbox: MailboxProcessor<StreamControlMessage<'T>>)
         =
         let safeEnd() =
             async {
@@ -223,43 +220,66 @@ type TorStream(circuit: TorCircuit) =
 
             let! {
                      Command = command
-                     ReplyChannel = replyChannel
                  } = inbox.Receive()
 
-            try
-                match command with
-                | End ->
+            match command with
+            | End replyChannel ->
+                try
                     do! safeEnd()
-                    StreamControlResult.Ok |> replyChannel.Reply
-                | Send data ->
+                    OperationResult.Ok() |> replyChannel.Reply
+                with
+                | exn -> 
+                    StreamContolHandleError.HandleError(exn, replyChannel)
+            | Send(data, replyChannel) ->
+                try
                     do! safeSend data
-                    StreamControlResult.Ok |> replyChannel.Reply
-                | StartServiceConnectionProcess(port, streamObj) ->
+                    OperationResult.Ok() |> replyChannel.Reply
+                with
+                | exn -> 
+                    StreamContolHandleError.HandleError(exn, replyChannel)
+            | StartServiceConnectionProcess(port, streamObj, replyChannel) ->
+                try
                     let! task = startServiceConnectionProcess(port, streamObj)
-                    StreamControlResult.OkWithTask task |> replyChannel.Reply
-                | StartDirectoryConnectionProcess streamObj ->
+                    OperationResult.Ok task |> replyChannel.Reply
+                with
+                | exn -> 
+                    StreamContolHandleError.HandleError(exn, replyChannel)
+            | StartDirectoryConnectionProcess(streamObj, replyChannel) ->
+                try
                     let! task = startDirectoryConnectionProcess(streamObj)
-                    StreamControlResult.OkWithTask task |> replyChannel.Reply
-                | RegisterStream(streamObj, streamId) ->
+                    OperationResult.Ok task |> replyChannel.Reply
+                with
+                | exn -> 
+                    StreamContolHandleError.HandleError(exn, replyChannel)
+            | RegisterStream(streamObj, streamId, replyChannel) ->
+                try
                     registerProcess(streamObj, streamId)
-                    StreamControlResult.Ok |> replyChannel.Reply
-                | HandleRelayConnected ->
+                    OperationResult.Ok() |> replyChannel.Reply
+                with
+                | exn -> 
+                    StreamContolHandleError.HandleError(exn, replyChannel)
+            | HandleRelayConnected replyChannel ->
+                try
                     handleRelayConnected()
-                    StreamControlResult.Ok |> replyChannel.Reply
-                | HandleRelayEnd(message, reason) ->
+                    OperationResult.Ok() |> replyChannel.Reply
+                with
+                | exn -> 
+                    StreamContolHandleError.HandleError(exn, replyChannel)
+            | HandleRelayEnd(message, reason, replyChannel) ->
+                try
                     handleRelayEnd(message, reason)
-                    StreamControlResult.Ok |> replyChannel.Reply
-                | SendSendMe ->
+                    OperationResult.Ok() |> replyChannel.Reply
+                with
+                | exn -> 
+                    StreamContolHandleError.HandleError(exn, replyChannel)
+            | SendSendMe replyChannel ->
+                try
                     do! sendSendMe()
-                    StreamControlResult.Ok |> replyChannel.Reply
-            with
-            | exn ->
-                match FSharpUtil.FindException<SocketException> exn with
-                | Some socketExn ->
-                    NOnionSocketException socketExn :> exn
-                    |> StreamControlResult.Failure
-                    |> replyChannel.Reply
-                | None -> StreamControlResult.Failure exn |> replyChannel.Reply
+                    OperationResult.Ok() |> replyChannel.Reply
+                with
+                | exn -> 
+                    StreamContolHandleError.HandleError(exn, replyChannel)
+                
 
             return! StreamControlMailBoxProcessor inbox
         }
@@ -267,8 +287,8 @@ type TorStream(circuit: TorCircuit) =
     let streamControlMailBox =
         MailboxProcessor.Start(StreamControlMailBoxProcessor)
 
-    let rec StreamRecieveMailBoxProcessor
-        (inbox: MailboxProcessor<StreamRecieveMessage>)
+    let rec StreamReceiveMailBoxProcessor
+        (inbox: MailboxProcessor<StreamReceiveMessage>)
         =
         let currentBufferHasRemainingBytes() =
             bufferLength > bufferOffset
@@ -304,18 +324,14 @@ type TorStream(circuit: TorCircuit) =
                         let! sendResult =
                             streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                                 {
-                                    Command = StreamContolCommand.SendSendMe
-                                    ReplyChannel = replyChannel
+                                    Command = StreamContolCommand.SendSendMe replyChannel
                                 }
                             )
 
                         match sendResult with
-                        | StreamControlResult.Ok -> return ()
-                        | StreamControlResult.Failure exn ->
+                        | OperationResult.Ok _ -> return ()
+                        | OperationResult.Failure exn ->
                             return raise <| FSharpUtil.ReRaise exn
-                        | _ ->
-                            return
-                                failwith "Unexpected return state from mailbox"
 
                 | RelayEnd reason when reason = EndReason.Done ->
                     TorLogger.Log(
@@ -411,22 +427,22 @@ type TorStream(circuit: TorCircuit) =
                  } = inbox.Receive()
 
             try
-                let! recieved = safeReceive(buffer, offset, length)
-                StreamRecieveResult.Ok recieved |> replyChannel.Reply
+                let! received = safeReceive(buffer, offset, length)
+                OperationResult.Ok received |> replyChannel.Reply
             with
             | exn ->
                 match FSharpUtil.FindException<SocketException> exn with
                 | Some socketExn ->
                     NOnionSocketException socketExn :> exn
-                    |> StreamRecieveResult.Failure
+                    |> OperationResult.Failure
                     |> replyChannel.Reply
-                | None -> StreamRecieveResult.Failure exn |> replyChannel.Reply
+                | None -> OperationResult.Failure exn |> replyChannel.Reply
 
-            return! StreamRecieveMailBoxProcessor inbox
+            return! StreamReceiveMailBoxProcessor inbox
         }
 
-    let streamRecieveMailBox =
-        MailboxProcessor.Start(StreamRecieveMailBoxProcessor)
+    let streamReceiveMailBox =
+        MailboxProcessor.Start(StreamReceiveMailBoxProcessor)
 
     static member Accept (streamId: uint16) (circuit: TorCircuit) =
         async {
@@ -449,16 +465,14 @@ type TorStream(circuit: TorCircuit) =
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
-                        Command = StreamContolCommand.End
-                        ReplyChannel = replyChannel
+                        Command = StreamContolCommand.End replyChannel
                     }
                 )
 
             match sendResult with
-            | StreamControlResult.Ok -> return ()
-            | StreamControlResult.Failure exn ->
+            | OperationResult.Ok _ -> return ()
+            | OperationResult.Failure exn ->
                 return raise <| FSharpUtil.ReRaise exn
-            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.EndAsync() =
@@ -470,16 +484,14 @@ type TorStream(circuit: TorCircuit) =
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
-                        Command = StreamContolCommand.Send data
-                        ReplyChannel = replyChannel
+                        Command = StreamContolCommand.Send(data, replyChannel)
                     }
                 )
 
             match sendResult with
-            | StreamControlResult.Ok -> return ()
-            | StreamControlResult.Failure exn ->
+            | OperationResult.Ok _ -> return ()
+            | OperationResult.Failure exn ->
                 return raise <| FSharpUtil.ReRaise exn
-            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.SendDataAsync data =
@@ -493,21 +505,20 @@ type TorStream(circuit: TorCircuit) =
                         Command =
                             StreamContolCommand.StartServiceConnectionProcess(
                                 port,
-                                self
+                                self,
+                                replyChannel
                             )
-                        ReplyChannel = replyChannel
                     }
                 )
 
             match sendResult with
-            | StreamControlResult.OkWithTask connectionProcessTcs ->
+            | OperationResult.Ok connectionProcessTcs ->
                 return!
                     connectionProcessTcs
                     |> Async.AwaitTask
                     |> FSharpUtil.WithTimeout Constants.StreamCreationTimeout
-            | StreamControlResult.Failure exn ->
+            | OperationResult.Failure exn ->
                 return raise <| FSharpUtil.ReRaise exn
-            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.ConnectToDirectory() =
@@ -516,21 +527,21 @@ type TorStream(circuit: TorCircuit) =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
                         Command =
-                            StreamContolCommand.StartDirectoryConnectionProcess
-                                self
-                        ReplyChannel = replyChannel
+                            StreamContolCommand.StartDirectoryConnectionProcess(
+                                self,
+                                replyChannel
+                            )
                     }
                 )
 
             match sendResult with
-            | StreamControlResult.OkWithTask connectionProcessTcs ->
+            | OperationResult.Ok connectionProcessTcs ->
                 return!
                     connectionProcessTcs
                     |> Async.AwaitTask
                     |> FSharpUtil.WithTimeout Constants.StreamCreationTimeout
-            | StreamControlResult.Failure exn ->
+            | OperationResult.Failure exn ->
                 return raise <| FSharpUtil.ReRaise exn
-            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.ConnectToDirectoryAsync() =
@@ -542,22 +553,20 @@ type TorStream(circuit: TorCircuit) =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
                         Command =
-                            StreamContolCommand.RegisterStream(self, streamId)
-                        ReplyChannel = replyChannel
+                            StreamContolCommand.RegisterStream(self, streamId, replyChannel)
                     }
                 )
 
             match sendResult with
-            | StreamControlResult.Ok -> return ()
-            | StreamControlResult.Failure exn ->
+            | OperationResult.Ok _ -> return ()
+            | OperationResult.Failure exn ->
                 return raise <| FSharpUtil.ReRaise exn
-            | _ -> return failwith "Unexpected return state from mailbox"
         }
 
     member self.Receive (buffer: array<byte>) (offset: int) (length: int) =
         async {
             let! sendResult =
-                streamRecieveMailBox.PostAndAsyncReply(fun replyChannel ->
+                streamReceiveMailBox.PostAndAsyncReply(fun replyChannel ->
                     {
                         StreamBuffer = buffer
                         BufferOffset = offset
@@ -567,8 +576,8 @@ type TorStream(circuit: TorCircuit) =
                 )
 
             match sendResult with
-            | StreamRecieveResult.Ok recieveAmount -> return recieveAmount
-            | StreamRecieveResult.Failure exn ->
+            | OperationResult.Ok receiveAmount -> return receiveAmount
+            | OperationResult.Failure exn ->
                 return raise <| FSharpUtil.ReRaise exn
         }
 
@@ -584,17 +593,14 @@ type TorStream(circuit: TorCircuit) =
                         streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
                             {
                                 Command =
-                                    StreamContolCommand.HandleRelayConnected
-                                ReplyChannel = replyChannel
+                                    StreamContolCommand.HandleRelayConnected replyChannel
                             }
                         )
 
                     match sendResult with
-                    | StreamControlResult.Ok -> return ()
-                    | StreamControlResult.Failure exn ->
+                    | OperationResult.Ok _ -> return ()
+                    | OperationResult.Failure exn ->
                         return raise <| FSharpUtil.ReRaise exn
-                    | _ ->
-                        return failwith "Unexpected return state from mailbox"
                 | RelayData _ -> incomingCells.Post message |> ignore<bool>
                 | RelaySendMe _ -> window.PackageIncrease()
                 | RelayEnd reason ->
@@ -604,17 +610,15 @@ type TorStream(circuit: TorCircuit) =
                                 Command =
                                     StreamContolCommand.HandleRelayEnd(
                                         message,
-                                        reason
+                                        reason,
+                                        replyChannel
                                     )
-                                ReplyChannel = replyChannel
                             }
                         )
 
                     match sendResult with
-                    | StreamControlResult.Ok -> return ()
-                    | StreamControlResult.Failure exn ->
+                    | OperationResult.Ok _ -> return ()
+                    | OperationResult.Failure exn ->
                         return raise <| FSharpUtil.ReRaise exn
-                    | _ ->
-                        return failwith "Unexpected return state from mailbox"
                 | _ -> ()
             }
