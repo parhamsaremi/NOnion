@@ -13,18 +13,11 @@ open NOnion
 open NOnion.Cells
 open NOnion.Utility
 
-// RequireQualifiedAccess is needed to prevent collision with
-// Failure function that creates general exceptions
-[<RequireQualifiedAccess>]
-type internal GuardSendResult =
-    | Ok
-    | Failure of exn
-
 type internal GuardSendMessage =
     {
         CircuitId: uint16
         CellToSend: ICell
-        ReplyChannel: AsyncReplyChannel<GuardSendResult>
+        ReplyChannel: AsyncReplyChannel<OperationResult<unit>>
     }
 
 type TorGuard private (client: TcpClient, sslStream: SslStream) =
@@ -82,15 +75,15 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
 
             try
                 do! innerSend circuitId cellToSend
-                replyChannel.Reply GuardSendResult.Ok
+                OperationResult.Ok() |> replyChannel.Reply
             with
             | exn ->
                 match FSharpUtil.FindException<SocketException> exn with
                 | Some socketExn ->
                     NOnionSocketException socketExn :> exn
-                    |> GuardSendResult.Failure
+                    |> OperationResult.Failure
                     |> replyChannel.Reply
-                | None -> GuardSendResult.Failure exn |> replyChannel.Reply
+                | None -> OperationResult.Failure exn |> replyChannel.Reply
 
             return! SendMailBoxProcessor inbox
         }
@@ -184,8 +177,8 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
                 )
 
             match sendResult with
-            | GuardSendResult.Ok -> return ()
-            | GuardSendResult.Failure exn ->
+            | OperationResult.Ok _ -> return ()
+            | OperationResult.Failure exn ->
                 return raise <| FSharpUtil.ReRaise exn
         }
 
