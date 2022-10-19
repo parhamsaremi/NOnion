@@ -324,9 +324,8 @@ type TorStream(circuit: TorCircuit) =
                     if window.NeedSendme() then
 
                         let! sendResult =
-                            streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
-                                StreamControlCommand.SendSendMe replyChannel
-                            )
+                            streamControlMailBox.PostAndAsyncReply
+                                StreamControlCommand.SendSendMe
 
                         match sendResult with
                         | OperationResult.Ok _ -> return ()
@@ -463,9 +462,7 @@ type TorStream(circuit: TorCircuit) =
     member __.End() =
         async {
             let! sendResult =
-                streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
-                    StreamControlCommand.End replyChannel
-                )
+                streamControlMailBox.PostAndAsyncReply StreamControlCommand.End
 
             match sendResult with
             | OperationResult.Ok _ -> return ()
@@ -581,10 +578,8 @@ type TorStream(circuit: TorCircuit) =
                 match message with
                 | RelayConnected _ ->
                     let! sendResult =
-                        streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
+                        streamControlMailBox.PostAndAsyncReply
                             StreamControlCommand.HandleRelayConnected
-                                replyChannel
-                        )
 
                     match sendResult with
                     | OperationResult.Ok _ -> return ()
