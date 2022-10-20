@@ -293,7 +293,7 @@ type TorStream(circuit: TorCircuit) =
                             streamControlMailBox.PostAndAsyncReply
                                 StreamControlMessage.SendSendMe
 
-                        return sendResult |> UnwrapResult
+                        return UnwrapResult sendResult 
 
                 | RelayEnd reason when reason = EndReason.Done ->
                     TorLogger.Log(
@@ -419,7 +419,7 @@ type TorStream(circuit: TorCircuit) =
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply StreamControlMessage.End
 
-            return sendResult |> UnwrapResult
+            return UnwrapResult sendResult 
         }
 
     member self.EndAsync() =
@@ -433,7 +433,7 @@ type TorStream(circuit: TorCircuit) =
                     StreamControlMessage.Send(data, replyChannel)
                 )
 
-            return sendResult |> UnwrapResult
+            return UnwrapResult sendResult 
         }
 
     member self.SendDataAsync data =
@@ -494,7 +494,7 @@ type TorStream(circuit: TorCircuit) =
                     )
                 )
 
-            return sendResult |> UnwrapResult
+            return UnwrapResult sendResult 
         }
 
     member self.Receive (buffer: array<byte>) (offset: int) (length: int) =
@@ -509,7 +509,7 @@ type TorStream(circuit: TorCircuit) =
                     }
                 )
 
-            return sendResult |> UnwrapResult
+            return UnwrapResult sendResult 
         }
 
     member self.ReceiveAsync(buffer: array<byte>, offset: int, length: int) =
@@ -524,7 +524,7 @@ type TorStream(circuit: TorCircuit) =
                         streamControlMailBox.PostAndAsyncReply
                             StreamControlMessage.HandleRelayConnected
 
-                    return sendResult |> UnwrapResult
+                    return UnwrapResult sendResult 
                 | RelayData _ -> incomingCells.Post message |> ignore<bool>
                 | RelaySendMe _ -> window.PackageIncrease()
                 | RelayEnd reason ->
@@ -537,6 +537,6 @@ type TorStream(circuit: TorCircuit) =
                             )
                         )
 
-                    return sendResult |> UnwrapResult
+                    return UnwrapResult sendResult 
                 | _ -> ()
             }
