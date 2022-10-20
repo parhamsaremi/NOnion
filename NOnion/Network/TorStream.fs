@@ -9,8 +9,8 @@ open FSharpx.Collections
 open NOnion
 open NOnion.Cells.Relay
 open NOnion.Utility
-open NOnion.Utility.MailboxResultUtil
 open System.Net.Sockets
+open MailboxResultUtil
 
 type internal StreamReceiveMessage =
     {
