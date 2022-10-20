@@ -9,7 +9,6 @@ open FSharpx.Collections
 open NOnion
 open NOnion.Cells.Relay
 open NOnion.Utility
-open System.Net.Sockets
 open MailboxResultUtil
 
 type internal StreamReceiveMessage =
@@ -20,7 +19,7 @@ type internal StreamReceiveMessage =
         ReplyChannel: AsyncReplyChannel<OperationResult<int>>
     }
 
-type internal StreamControlCommand =
+type internal StreamControlMessage =
     | End of replayChannel: AsyncReplyChannel<OperationResult<unit>>
     | Send of
         array<byte> *
@@ -60,7 +59,7 @@ type TorStream(circuit: TorCircuit) =
     let incomingCells: BufferBlock<RelayData> = BufferBlock<RelayData>()
 
     let rec StreamControlMailBoxProcessor
-        (inbox: MailboxProcessor<StreamControlCommand>)
+        (inbox: MailboxProcessor<StreamControlMessage>)
         =
         let safeEnd() =
             async {
@@ -292,7 +291,7 @@ type TorStream(circuit: TorCircuit) =
 
                         let! sendResult =
                             streamControlMailBox.PostAndAsyncReply
-                                StreamControlCommand.SendSendMe
+                                StreamControlMessage.SendSendMe
 
                         return sendResult |> UnwrapResult
 
@@ -418,7 +417,7 @@ type TorStream(circuit: TorCircuit) =
     member __.End() =
         async {
             let! sendResult =
-                streamControlMailBox.PostAndAsyncReply StreamControlCommand.End
+                streamControlMailBox.PostAndAsyncReply StreamControlMessage.End
 
             return sendResult |> UnwrapResult
         }
@@ -431,7 +430,7 @@ type TorStream(circuit: TorCircuit) =
         async {
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
-                    StreamControlCommand.Send(data, replyChannel)
+                    StreamControlMessage.Send(data, replyChannel)
                 )
 
             return sendResult |> UnwrapResult
@@ -445,7 +444,7 @@ type TorStream(circuit: TorCircuit) =
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply(
                     (fun replyChannel ->
-                        StreamControlCommand.StartServiceConnectionProcess(
+                        StreamControlMessage.StartServiceConnectionProcess(
                             port,
                             self,
                             replyChannel
@@ -466,7 +465,7 @@ type TorStream(circuit: TorCircuit) =
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply(
                     (fun replyChannel ->
-                        StreamControlCommand.StartDirectoryConnectionProcess(
+                        StreamControlMessage.StartDirectoryConnectionProcess(
                             self,
                             replyChannel
                         )
@@ -488,7 +487,7 @@ type TorStream(circuit: TorCircuit) =
         async {
             let! sendResult =
                 streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
-                    StreamControlCommand.RegisterStream(
+                    StreamControlMessage.RegisterStream(
                         self,
                         streamId,
                         replyChannel
@@ -523,7 +522,7 @@ type TorStream(circuit: TorCircuit) =
                 | RelayConnected _ ->
                     let! sendResult =
                         streamControlMailBox.PostAndAsyncReply
-                            StreamControlCommand.HandleRelayConnected
+                            StreamControlMessage.HandleRelayConnected
 
                     return sendResult |> UnwrapResult
                 | RelayData _ -> incomingCells.Post message |> ignore<bool>
@@ -531,7 +530,7 @@ type TorStream(circuit: TorCircuit) =
                 | RelayEnd reason ->
                     let! sendResult =
                         streamControlMailBox.PostAndAsyncReply(fun replyChannel ->
-                            StreamControlCommand.HandleRelayEnd(
+                            StreamControlMessage.HandleRelayEnd(
                                 message,
                                 reason,
                                 replyChannel
