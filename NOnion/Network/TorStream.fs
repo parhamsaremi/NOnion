@@ -450,7 +450,7 @@ type TorStream(circuit: TorCircuit) =
                             replyChannel
                         )
                     ),
-                    Constants.CircuitOperationTimeout.TotalMilliseconds |> int
+                    Constants.StreamCreationTimeout.TotalMilliseconds |> int
                 )
 
             return
@@ -470,7 +470,7 @@ type TorStream(circuit: TorCircuit) =
                             replyChannel
                         )
                     ),
-                    Constants.CircuitOperationTimeout.TotalMilliseconds |> int
+                    Constants.StreamCreationTimeout.TotalMilliseconds |> int
                 )
 
             return
