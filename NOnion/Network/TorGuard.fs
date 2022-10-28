@@ -137,7 +137,10 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
                     match FSharpUtil.FindException<SocketException> exn with
                     | Some socketEx ->
                         return raise <| GuardConnectionFailedException socketEx
-                    | None -> return raise <| FSharpUtil.ReRaise exn
+                    | None ->
+                        match FSharpUtil.FindException<IOException> exn with
+                        | Some ioExp -> return raise <| NOnionIOException ioExp
+                        | None -> return raise <| FSharpUtil.ReRaise exn
 
             ipEndpoint.ToString()
             |> sprintf "TorGuard: ssl connection to %s guard node authenticated"

@@ -50,3 +50,10 @@ type NOnionSocketException
             "Got socket exception during data transfer",
             innerException
         )
+
+type NOnionIOException internal (innerException: System.IO.IOException) =
+    inherit NOnionException
+        (
+            "Got IO exception during data transfer",
+            innerException
+        )
