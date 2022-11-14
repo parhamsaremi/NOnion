@@ -26,6 +26,9 @@ type CircuitTruncatedException internal (reason: DestroyReason) =
 type CircuitDestroyedException internal (reason: DestroyReason) =
     inherit NOnionException(sprintf "Circuit got destroyed, reason %A" reason)
 
+type CircuitDecryptionFailedException internal () =
+    inherit NOnionException(sprintf "Circuit Decryption Failed")
+
 type TimeoutErrorException internal () =
     inherit NOnionException("Time limit exceeded for operation")
 
