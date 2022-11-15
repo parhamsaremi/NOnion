@@ -336,7 +336,11 @@ and TorCircuit
                                  node)
                     | None ->
                         announceDeath()
-                        raise (CircuitDestroyedException(DestroyReason.DescriptionFail))
+
+                        raise
+                        <| CircuitDestroyedException(
+                            DestroyReason.DescriptionFail
+                        )
 
                 decryptMessage encryptedRelayCell.EncryptedData nodes
             | _ -> failwith "Unexpected state when receiving relay cell"
