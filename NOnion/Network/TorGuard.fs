@@ -329,7 +329,18 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
                         | Some circuit ->
                             // Some circuit handlers send data, which by itself might try to use the stream
                             // after it's already disposed, so we need to be able to handle cancellation during cell handling as well
-                            do! circuit.HandleIncomingCell cell
+                            try
+                                do! circuit.HandleIncomingCell cell
+                            with
+                            | :? CircuitDestroyedException as ex ->
+                                sprintf
+                                    "TorGuard: exception when trying to handle incoming cell type=%i, ex=%s"
+                                    cell.Command
+                                    (ex.ToString())
+                                |> TorLogger.Log
+
+                                self.KillChildCircuits()
+                            | ex -> return raise <| FSharpUtil.ReRaise ex
                         | None ->
                             self.KillChildCircuits()
                             failwithf "Unknown circuit, Id = %i" cid
