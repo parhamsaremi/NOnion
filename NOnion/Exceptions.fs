@@ -29,6 +29,9 @@ type CircuitDestroyedException internal (reason: DestroyReason) =
 type CircuitDecryptionFailedException internal () =
     inherit NOnionException(sprintf "Circuit Decryption Failed")
 
+type HandshakeFailedException internal () =
+    inherit NOnionException(sprintf "Key handshake failed!")
+
 type TimeoutErrorException internal () =
     inherit NOnionException("Time limit exceeded for operation")
 

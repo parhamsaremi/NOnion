@@ -193,6 +193,18 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
     member self.SendAsync (circuidId: uint16) (cellToSend: ICell) =
         self.Send circuidId cellToSend |> Async.StartAsTask
 
+    member private self.HandleIncomingCellException<'T when 'T :> NOnionException>
+        (cell: ICell)
+        (ex: 'T)
+        =
+        sprintf
+            "TorGuard: exception when trying to handle incoming cell type=%i, ex=%s"
+            cell.Command
+            (ex.ToString())
+        |> TorLogger.Log
+
+        self.KillChildCircuits()
+
     member private __.ReceiveInternal() =
         async {
             (*
@@ -332,14 +344,14 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
                             try
                                 do! circuit.HandleIncomingCell cell
                             with
+                            | :? HandshakeFailedException as ex ->
+                                self.HandleIncomingCellException<HandshakeFailedException>
+                                    cell
+                                    ex
                             | :? CircuitDecryptionFailedException as ex ->
-                                sprintf
-                                    "TorGuard: exception when trying to handle incoming cell type=%i, ex=%s"
-                                    cell.Command
-                                    (ex.ToString())
-                                |> TorLogger.Log
-
-                                self.KillChildCircuits()
+                                self.HandleIncomingCellException<CircuitDecryptionFailedException>
+                                    cell
+                                    ex
                             | ex -> return raise <| FSharpUtil.ReRaise ex
                         | None ->
                             self.KillChildCircuits()
