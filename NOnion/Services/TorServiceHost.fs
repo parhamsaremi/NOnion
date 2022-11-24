@@ -764,7 +764,6 @@ type TorServiceHost
 
     member self.Start() =
         async {
-            failwith "Parham: some random error for testing"
             do! self.RegisterIntroductionPoints()
 
             do! self.KeepDescriptorsUpToDate()
