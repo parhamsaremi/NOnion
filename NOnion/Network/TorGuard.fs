@@ -352,7 +352,14 @@ type TorGuard private (client: TcpClient, sslStream: SslStream) =
                                 self.HandleIncomingCellException<CircuitDecryptionFailedException>
                                     cell
                                     ex
-                            | ex -> return raise <| FSharpUtil.ReRaise ex
+                            | ex -> 
+                                sprintf
+                                    "TorGuard: exception when trying to handle incoming cell type=%i, ex=%s"
+                                    cell.Command
+                                    (ex.ToString())
+                                |> TorLogger.Log
+
+                                self.KillChildCircuits()
                         | None ->
                             self.KillChildCircuits()
                             failwithf "Unknown circuit, Id = %i" cid
