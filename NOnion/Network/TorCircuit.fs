@@ -1308,7 +1308,6 @@ and TorCircuit
 
         member self.HandleIncomingCell(cell: ICell) =
             async {
-                failwith "Parham: random error in HandleIncomingCell"
                 //FIXME: add exception handling to mailbox and remove reply from here?
                 let! handleRes =
                     circuitOperationsMailBox.PostAndAsyncReply(fun replyChannel ->
