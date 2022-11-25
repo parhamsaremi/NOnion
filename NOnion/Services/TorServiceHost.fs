@@ -107,6 +107,7 @@ type TorServiceHost
             introEncPubKey
             =
             async {
+                return raise <| System.AggregateException()
                 let! endPoint, randomNodeDetails =
                     directory.GetRouter RouterType.Guard
 
